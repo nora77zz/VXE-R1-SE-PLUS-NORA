@@ -25,7 +25,7 @@ A biblioteca de scripts salva os textos e o histórico localmente. O diagnóstic
 
 ## Conexão do mouse
 
-O transporte aceita as coleções de configuração FF02/2 do receptor `373B:1085` e do mouse USB `3554:F58F`, correlacionadas com a coleção FF04/2 do mesmo dispositivo físico. Com um mouse e um receptor conectados, o cabo tem prioridade; removê-lo restaura o receptor salvo. Inventários com múltiplos cabos ou pares ambíguos exigem seleção explícita.
+O transporte aceita as coleções de configuração FF02/2 do receptor `373B:1085` e do mouse USB `3554:F58F`, correlacionadas com a coleção FF04/2 do mesmo dispositivo físico. Com um mouse e um receptor conectados, o cabo tem prioridade; removê-lo restaura o receptor salvo. Inventários com múltiplos cabos ou pares ambíguos ficam bloqueados para evitar uma troca arbitrária.
 
 As notificações HID do Windows apenas sinalizam o ator. A enumeração aguarda a estabilização das coleções e tem uma nova tentativa curta, além da verificação periódica de recuperação. Leituras em andamento observam uma revisão da conexão e são interrompidas quando ela muda. Os comandos assíncronos mantêm a espera fora da thread da janela.
 
