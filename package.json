@@ -1,0 +1,14 @@
+{
+  "name": "atk-hub-release-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned Tauri CLI used to package ATK HUB for Windows.",
+  "scripts": {
+    "tauri:signer:help": "tauri signer generate --help",
+    "release:build": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release/build.ps1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
+    "playwright": "1.62.1"
+  }
+}

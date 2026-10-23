@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/atk-protocol",
+    "crates/atk-device",
+    "tools/diagnostics/hid-inspector",
+    "tools/diagnostics/device-info",
+]

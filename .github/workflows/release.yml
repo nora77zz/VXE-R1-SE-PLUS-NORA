@@ -1,0 +1,81 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $installer = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+            Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -OutFile $installer
+            & $installer -y --profile minimal --default-host x86_64-pc-windows-msvc --default-toolchain none
+            if ($LASTEXITCODE -ne 0) { throw "rustup installation failed ($LASTEXITCODE)." }
+            $cargoBin = Join-Path $env:USERPROFILE '.cargo/bin'
+            $env:PATH = "$cargoBin;$env:PATH"
+          }
+          rustup toolchain install 1.93.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "Rust 1.93.0 installation failed ($LASTEXITCODE)." }
+          rustup run 1.93.0 rustc --version
+          if ($LASTEXITCODE -ne 0) { throw "Rust 1.93.0 rustc is unavailable ($LASTEXITCODE)." }
+          rustup run 1.93.0 cargo --version
+          if ($LASTEXITCODE -ne 0) { throw "Rust 1.93.0 cargo is unavailable ($LASTEXITCODE)." }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install the pinned Tauri CLI
+        shell: pwsh
+        run: |
+          node --version
+          npm ci
+          npm exec -- tauri --version
+
+      - name: Build worker and signed NSIS bundles
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run release:build
+
+      - name: Prepare and validate release assets
+        id: artifacts
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $artifactDirectory = Join-Path $env:RUNNER_TEMP "atk-hub-release-$version"
+          & ./scripts/release/prepare-release.ps1 `
+            -Version $version `
+            -Tag $env:GITHUB_REF_NAME `
+            -Repository $env:GITHUB_REPOSITORY `
+            -OutputDirectory $artifactDirectory
+          "ATK_RELEASE_ARTIFACTS=$artifactDirectory" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Publish verified assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          & ./scripts/release/publish-release.ps1 `
+            -Version $version `
+            -Tag $env:GITHUB_REF_NAME `
+            -Repository $env:GITHUB_REPOSITORY `
+            -ArtifactsDirectory $env:ATK_RELEASE_ARTIFACTS

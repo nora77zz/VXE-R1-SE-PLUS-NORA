@@ -1,0 +1,48 @@
+# Rust and Tauri build products
+/target/
+**/target/
+/apps/desktop/src-tauri/gen/schemas/
+/app/src-tauri/target/
+/tools/*
+!/tools/diagnostics/
+/tools/diagnostics/*
+!/tools/diagnostics/hid-inspector/
+!/tools/diagnostics/device-info/
+/app/frontend/
+/extracted_official_frontend/
+/app/src-tauri/gen/schemas/
+/apps/desktop/src-tauri/private-keys/
+
+# JavaScript dependencies and generated release artifacts
+/node_modules/
+**/node_modules/
+/release-artifacts/
+/dist/
+/evidence/
+/.local/
+/.local/**
+*.exe
+*.msi
+*.nsis.zip
+*.sig
+
+# Local captures and runtime data
+*.log
+*.dmp
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+/private-keys/
+/app/src-tauri/private-keys/
+/Iniciar-ATK-HUB.bat
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

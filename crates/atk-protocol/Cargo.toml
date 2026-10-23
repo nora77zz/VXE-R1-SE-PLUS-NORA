@@ -1,0 +1,9 @@
+[package]
+name = "atk-protocol"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "atk_protocol"
+path = "src/lib.rs"

@@ -1,0 +1,42 @@
+[package]
+name = "atk-hub"
+version = "1.0.0"
+description = "ATK HUB desktop reconstruction"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+atk-device = { path = "../../../crates/atk-device" }
+atk-protocol = { path = "../../../crates/atk-protocol" }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lua-process = { path = "../../../crates/lua-process" }
+ghub-lua = { path = "../../../crates/ghub-lua" }
+tauri-plugin-updater = "2.14"
+tauri-plugin-single-instance = "2.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-input = { path = "../../../crates/windows-input" }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dependencies.tauri]
+version = "2"
+features = ["tray-icon"]
+
+[[bin]]
+name = "atk-hub"
+path = "src/main.rs"

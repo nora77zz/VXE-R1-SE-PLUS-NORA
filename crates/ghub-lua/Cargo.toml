@@ -1,0 +1,11 @@
+[package]
+name = "ghub-lua"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+mlua = { version = "=0.12.2", features = ["lua54", "vendored"] }
+serde = { version = "=1.0.229", features = ["derive"] }

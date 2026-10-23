@@ -1,0 +1,9 @@
+[package]
+name = "atk-read-info"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+atk-device = { path = "../../../crates/atk-device" }
+serde_json = "1"

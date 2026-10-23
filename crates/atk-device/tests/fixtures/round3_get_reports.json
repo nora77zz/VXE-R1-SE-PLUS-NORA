@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "source": "evidence/mouse_read_info_round3_ff02.json; only the four response wire byte arrays are retained",
+  "note": "No device path, serial, binding metadata, or unique device identifier is included.",
+  "wireReports": [
+    [8, 16, 0, 0, 0, 3, 2, 32, 51, 0, 0, 0, 0, 0, 0, 0, 229],
+    [8, 18, 0, 0, 0, 2, 3, 21, 0, 0, 0, 0, 0, 0, 0, 0, 33],
+    [8, 29, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 47],
+    [8, 4, 0, 0, 0, 2, 30, 0, 14, 94, 0, 0, 0, 0, 0, 0, 189]
+  ]
+}
