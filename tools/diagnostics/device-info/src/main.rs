@@ -7,6 +7,7 @@ enum Mode {
     Help,
     List,
     ReadInfo,
+    ReadWiredInfo,
 }
 
 fn parse_mode(args: &[String]) -> Result<Mode, &'static str> {
@@ -15,6 +16,7 @@ fn parse_mode(args: &[String]) -> Result<Mode, &'static str> {
         [flag] if flag == "--help" || flag == "-h" => Ok(Mode::Help),
         [flag] if flag == "--list" => Ok(Mode::List),
         [flag] if flag == "--read-info" => Ok(Mode::ReadInfo),
+        [flag] if flag == "--read-wired-info" => Ok(Mode::ReadWiredInfo),
         _ => Err("unknown or conflicting arguments"),
     }
 }
@@ -51,7 +53,11 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Mode::ReadInfo => match read_target_info(DEFAULT_QUERY_TIMEOUT) {
+        Mode::ReadInfo | Mode::ReadWiredInfo => match if mode == Mode::ReadWiredInfo {
+            read_wired_info()
+        } else {
+            read_target_info(DEFAULT_QUERY_TIMEOUT)
+        } {
             Ok(info) => match serde_json::to_string_pretty(&info) {
                 Ok(json) => {
                     println!("{json}");
@@ -70,6 +76,20 @@ fn main() -> ExitCode {
     }
 }
 
+fn read_wired_info() -> Result<atk_device::DeviceInfo, atk_device::DeviceError> {
+    let candidates = atk_device::list_target_devices()?;
+    let wired: Vec<_> = candidates.iter().filter(|device|
+        device.interface.vendor_id == atk_device::WIRED_VENDOR_ID
+        && device.interface.product_id == atk_device::WIRED_PRODUCT_ID).collect();
+    let selected = match wired.as_slice() {
+        [device] => *device,
+        [] => return Err(atk_device::DeviceError::NoMatchingCollection),
+        many => return Err(atk_device::DeviceError::MultipleMatchingCollections { count: many.len() }),
+    };
+    let mut session = atk_device::open_report_session_for_key(&selected.device_key, DEFAULT_QUERY_TIMEOUT)?;
+    atk_device::read_info_with_report_session(&mut session, |_| {})
+}
+
 fn print_usage() {
     println!(
         "atk-read-info\n\
@@ -77,6 +97,7 @@ fn print_usage() {
           atk-read-info [--help]\n\
           atk-read-info --list\n\
           atk-read-info --read-info\n\
+          atk-read-info --read-wired-info\n\
          Default behavior prints this help and performs no HID I/O.\n\
          --list enumerates matching collection metadata only.\n\
          --read-info explicitly sends the four read-only GET requests."

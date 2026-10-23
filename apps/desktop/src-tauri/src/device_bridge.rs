@@ -2,7 +2,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::cell::RefCell;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const SELECTION_FILE: &str = "device_selection.json";
-const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const HOTPLUG_SETTLE_INTERVAL: Duration = Duration::from_millis(60);
 const IDLE_REPORT_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(750);
 const ACTOR_QUEUE_CAPACITY: usize = 64;
@@ -36,6 +39,8 @@ pub struct DeviceMemoryState {
     pub diagnostic_status: DiagnosticStatus,
     pub last_check_at_ms: Option<u64>,
     pub communication_error: Option<String>,
+    pub transport: Option<&'static str>,
+    pub charging: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -56,6 +61,7 @@ struct DeviceDiagnostics {
     status: DiagnosticStatus,
     last_check_at_ms: Option<u64>,
     communication_error: Option<String>,
+    charging: Option<bool>,
 }
 
 impl DeviceDiagnostics {
@@ -83,6 +89,7 @@ impl DeviceDiagnostics {
             self.target_device_key = Some(device_key.to_owned());
         }
         self.identity_device_key = None;
+        self.charging = None;
         self.status = DiagnosticStatus::Failed;
         self.last_check_at_ms = Some(unix_time_ms());
         self.communication_error = Some(error.to_owned());
@@ -90,6 +97,7 @@ impl DeviceDiagnostics {
 
     fn invalidate_for_disconnect(&mut self) {
         self.identity_device_key = None;
+        self.charging = None;
         if self.target_device_key.is_some() {
             self.status = DiagnosticStatus::Disconnected;
         }
@@ -111,6 +119,7 @@ fn unix_time_ms() -> u64 {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeviceMemoryInputReport {
+    device_key: String,
     report_id: u8,
     data: Vec<u8>,
 }
@@ -121,6 +130,10 @@ struct SavedSelection {
     schema_version: u8,
     device_key: String,
     serial_number: Option<String>,
+    #[serde(default)]
+    receiver_key: Option<String>,
+    #[serde(default)]
+    wired_key: Option<String>,
 }
 
 enum SelectionResolution<'a> {
@@ -158,6 +171,7 @@ enum ActorRequest {
         reply: SyncSender<Result<atk_device::DeviceInfo, String>>,
     },
     Shutdown,
+    InventoryChanged,
 }
 
 struct ActorEnvelope {
@@ -170,6 +184,7 @@ struct ActorEnvelope {
 pub struct DeviceMemoryBridge {
     sender: SyncSender<ActorEnvelope>,
     actor_thread: Mutex<Option<JoinHandle<()>>>,
+    cached_state: Arc<Mutex<Option<DeviceMemoryState>>>,
 }
 
 impl DeviceMemoryBridge {
@@ -188,17 +203,21 @@ impl DeviceMemoryBridge {
             Err(error) => (None, Some(error)),
         };
         let (sender, receiver) = mpsc::sync_channel(ACTOR_QUEUE_CAPACITY);
+        let cached_state = Arc::new(Mutex::new(None));
+        let actor_cache = Arc::clone(&cached_state);
+        let actor_sender = sender.clone();
         let actor_thread = thread::Builder::new()
             .name("atk-device-memory".to_owned())
-            .spawn(move || actor_loop(app, selection_path, selection, startup_error, receiver))
+            .spawn(move || actor_loop(app, selection_path, selection, startup_error, receiver, actor_sender, actor_cache))
             .map_err(|error| format!("Não foi possível iniciar o actor HID do mouse: {error}"))?;
         Ok(Self {
             sender,
             actor_thread: Mutex::new(Some(actor_thread)),
+            cached_state,
         })
     }
 
-    fn request<T>(
+    async fn request<T: Send + 'static>(
         &self,
         build: impl FnOnce(SyncSender<Result<T, String>>) -> ActorRequest,
     ) -> Result<T, String> {
@@ -216,19 +235,20 @@ impl DeviceMemoryBridge {
                 return Err("O actor HID do mouse foi encerrado.".to_owned());
             }
         }
-        reply_rx
-            .recv_timeout(REQUEST_TIMEOUT)
+        tauri::async_runtime::spawn_blocking(move || reply_rx.recv_timeout(REQUEST_TIMEOUT))
+            .await
+            .map_err(|error| format!("A espera pela operação HID foi interrompida: {error}"))?
             .map_err(|error| match error {
                 RecvTimeoutError::Timeout => "A operação HID excedeu o prazo de resposta.".to_owned(),
                 RecvTimeoutError::Disconnected => "O actor HID do mouse encerrou antes de responder.".to_owned(),
             })?
     }
 
-    pub fn read_target_info_for(
+    pub async fn read_target_info_for(
         &self,
         device_key: Option<String>,
     ) -> Result<atk_device::DeviceInfo, String> {
-        self.request(|reply| ActorRequest::ReadTargetInfo { device_key, reply })
+        self.request(|reply| ActorRequest::ReadTargetInfo { device_key, reply }).await
     }
 }
 
@@ -246,14 +266,17 @@ impl Drop for DeviceMemoryBridge {
 }
 
 #[tauri::command]
-pub fn device_memory_state(
+pub async fn device_memory_state(
     bridge: State<'_, DeviceMemoryBridge>,
 ) -> Result<DeviceMemoryState, String> {
-    bridge.request(ActorRequest::State)
+    if let Some(state) = lock(&bridge.cached_state).clone() {
+        return Ok(state);
+    }
+    bridge.request(ActorRequest::State).await
 }
 
 #[tauri::command]
-pub fn device_memory_remember(
+pub async fn device_memory_remember(
     device_key: Option<String>,
     serial_number: Option<String>,
     bridge: State<'_, DeviceMemoryBridge>,
@@ -262,34 +285,34 @@ pub fn device_memory_remember(
         device_key,
         serial_number,
         reply,
-    })
+    }).await
 }
 
 #[tauri::command]
-pub fn device_memory_clear(
+pub async fn device_memory_clear(
     bridge: State<'_, DeviceMemoryBridge>,
 ) -> Result<DeviceMemoryState, String> {
-    bridge.request(ActorRequest::Clear)
+    bridge.request(ActorRequest::Clear).await
 }
 
 #[tauri::command]
-pub fn device_memory_open(
+pub async fn device_memory_open(
     device_key: Option<String>,
     bridge: State<'_, DeviceMemoryBridge>,
 ) -> Result<DeviceMemoryState, String> {
-    bridge.request(|reply| ActorRequest::Open { device_key, reply })
+    bridge.request(|reply| ActorRequest::Open { device_key, reply }).await
 }
 
 #[tauri::command]
-pub fn device_memory_close(
+pub async fn device_memory_close(
     device_key: Option<String>,
     bridge: State<'_, DeviceMemoryBridge>,
 ) -> Result<DeviceMemoryState, String> {
-    bridge.request(|reply| ActorRequest::Close { device_key, reply })
+    bridge.request(|reply| ActorRequest::Close { device_key, reply }).await
 }
 
 #[tauri::command]
-pub fn device_memory_send_report(
+pub async fn device_memory_send_report(
     device_key: Option<String>,
     report_id: u8,
     data: Vec<u8>,
@@ -300,7 +323,7 @@ pub fn device_memory_send_report(
         report_id,
         data,
         reply,
-    })
+    }).await
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -366,6 +389,28 @@ fn resolve_selection<'a>(
     let Some(saved) = saved else {
         return SelectionResolution::Unremembered;
     };
+    let wired: Vec<_> = candidates.iter().filter(|device| is_wired(device)).collect();
+    let receivers: Vec<_> = candidates.iter().filter(|device| !is_wired(device)).collect();
+    // The supported cable and receiver form one logical mouse only when the
+    // physical inventory is unambiguous. Never choose among multiple cables.
+    if wired.len() == 1 && receivers.len() <= 1 {
+        let device = wired[0];
+        return if device.device_key == saved.device_key {
+            SelectionResolution::Connected(device)
+        } else {
+            SelectionResolution::Reidentified(device)
+        };
+    }
+    if !wired.is_empty() {
+        return SelectionResolution::Ambiguous;
+    }
+    if let Some(key) = &saved.receiver_key {
+        if let Some(device) = receivers.iter().find(|device| device.device_key == *key) {
+            return SelectionResolution::Connected(device);
+        }
+    } else if saved.wired_key.is_some() && receivers.len() == 1 {
+        return SelectionResolution::Reidentified(receivers[0]);
+    }
     let exact: Vec<_> = candidates
         .iter()
         .filter(|candidate| candidate.device_key == saved.device_key)
@@ -395,6 +440,11 @@ fn resolve_selection<'a>(
     }
 }
 
+fn is_wired(device: &atk_device::TargetDevice) -> bool {
+    device.interface.vendor_id == atk_device::WIRED_VENDOR_ID
+        && device.interface.product_id == atk_device::WIRED_PRODUCT_ID
+}
+
 fn state_from(
     saved: Option<&SavedSelection>,
     candidates: Vec<atk_device::TargetDevice>,
@@ -412,6 +462,7 @@ fn state_from(
         SelectionResolution::Unremembered | SelectionResolution::Disconnected => (None, false),
     };
     let connected = selected.is_some();
+    let transport = selected.as_ref().map(|device| if is_wired(device) { "usb" } else { "receiver" });
     let identity_responded = selected.as_ref().is_some_and(|device| {
         connected && diagnostics.identity_device_key.as_deref() == Some(device.device_key.as_str())
     });
@@ -437,11 +488,28 @@ fn state_from(
         diagnostic_status,
         last_check_at_ms: diagnostics.last_check_at_ms,
         communication_error: diagnostics.communication_error.clone(),
+        transport,
+        charging: identity_responded.then_some(diagnostics.charging).flatten(),
     }
 }
 
+thread_local! {
+    static INVENTORY: RefCell<Option<Vec<atk_device::TargetDevice>>> = const { RefCell::new(None) };
+}
+
+fn invalidate_inventory() {
+    INVENTORY.with(|inventory| *inventory.borrow_mut() = None);
+}
+
 fn enumerate_candidates() -> Result<Vec<atk_device::TargetDevice>, String> {
-    atk_device::list_target_devices().map_err(|error| error.to_string())
+    INVENTORY.with(|inventory| {
+        if let Some(candidates) = inventory.borrow().as_ref() {
+            return Ok(candidates.clone());
+        }
+        let candidates = atk_device::list_target_devices().map_err(|error| error.to_string())?;
+        *inventory.borrow_mut() = Some(candidates.clone());
+        Ok(candidates)
+    })
 }
 
 fn actor_loop(
@@ -450,7 +518,25 @@ fn actor_loop(
     mut saved: Option<SavedSelection>,
     startup_error: Option<String>,
     receiver: Receiver<ActorEnvelope>,
+    sender: SyncSender<ActorEnvelope>,
+    cached_state: Arc<Mutex<Option<DeviceMemoryState>>>,
 ) {
+    let inventory_dirty = Arc::new(AtomicBool::new(false));
+    let topology_revision = Arc::new(AtomicU64::new(0));
+    #[cfg(windows)]
+    let _watcher = {
+        let dirty = Arc::clone(&inventory_dirty);
+        let revision = Arc::clone(&topology_revision);
+        atk_device::device_changes::DeviceChangeWatcher::new(move || {
+            revision.fetch_add(1, Ordering::AcqRel);
+            if !dirty.swap(true, Ordering::AcqRel) {
+                let _ = sender.try_send(ActorEnvelope {
+                    deadline: Instant::now() + REQUEST_TIMEOUT,
+                    request: ActorRequest::InventoryChanged,
+                });
+            }
+        }).ok()
+    };
     let mut session: Option<atk_device::ReportSession> = None;
     let mut session_key: Option<String> = None;
     let mut reopen_requested = false;
@@ -459,8 +545,21 @@ fn actor_loop(
     let mut next_status_poll = Instant::now();
     let mut next_reconnect = Instant::now();
     let mut previous_state: Option<DeviceMemoryState> = None;
+    let mut hotplug_refresh: Option<Instant> = None;
+    let mut hotplug_retry: Option<Instant> = None;
 
     loop {
+        if inventory_dirty.swap(false, Ordering::AcqRel) {
+            hotplug_refresh.get_or_insert(Instant::now() + HOTPLUG_SETTLE_INTERVAL);
+            hotplug_retry = Some(Instant::now() + Duration::from_millis(350));
+        }
+        if hotplug_refresh.is_some_and(|deadline| Instant::now() >= deadline)
+            || hotplug_retry.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            if hotplug_refresh.is_some_and(|deadline| Instant::now() >= deadline) { hotplug_refresh = None; }
+            if hotplug_retry.is_some_and(|deadline| Instant::now() >= deadline) { hotplug_retry = None; }
+            next_status_poll = Instant::now();
+        }
         let received = receiver.recv_timeout(IDLE_REPORT_POLL_INTERVAL).map(|envelope| {
             request_before_deadline(envelope, Instant::now())
         });
@@ -536,6 +635,7 @@ fn actor_loop(
                     &mut session,
                     &mut session_key,
                     device_key.as_deref(),
+                    &topology_revision,
                 )
                     .and_then(|()| {
                         reopen_requested = true;
@@ -593,15 +693,19 @@ fn actor_loop(
                     match session.as_mut() {
                     Some(session) => {
                         let app_for_event = app.clone();
+                        let event_key = selected_key.clone();
                         transaction_attempted = true;
                         match session.transact_hid_report(report_id, &data, move |report| {
-                            emit_wire_report(&app_for_event, &report);
+                            emit_wire_report(&app_for_event, &event_key, &report);
                         }) {
                             Ok(report) => {
-                                emit_wire_report(&app, &report);
+                                emit_wire_report(&app, &selected_key, &report);
                                 Ok(())
                             }
-                            Err(error) => Err(error.to_string()),
+                            Err(error) => {
+                                transaction_attempted = report_error_invalidates_session(&error);
+                                Err(error.to_string())
+                            },
                         }
                     }
                     None => Err("O mouse ainda não foi aberto pelo ATK HUB.".to_owned()),
@@ -638,6 +742,7 @@ fn actor_loop(
                             &mut session,
                             &mut session_key,
                             Some(&target_key),
+                            &topology_revision,
                         )?;
                         reopen_requested = true;
                     } else {
@@ -647,8 +752,9 @@ fn actor_loop(
                         .as_mut()
                         .ok_or_else(|| "O mouse selecionado não está conectado.".to_owned())?;
                     let app_for_event = app.clone();
+                    let event_key = target_key.clone();
                     atk_device::read_info_with_report_session(session, move |report| {
-                        emit_wire_report(&app_for_event, &report);
+                        emit_wire_report(&app_for_event, &event_key, &report);
                     })
                     .map(|info| (target_key, info))
                     .map_err(|error| error.to_string())
@@ -656,6 +762,9 @@ fn actor_loop(
                 let result = match result {
                     Ok((target_key, info)) => {
                         diagnostics.record_response(&target_key, identity_from_device_info(&info));
+                        diagnostics.charging = info.queries.iter().find(|query| query.command_id == 0x04)
+                            .and_then(|query| query.known_values.battery_raw.as_ref())
+                            .and_then(|battery| match battery.charging { 0 => Some(false), 1 => Some(true), _ => None });
                         last_error = None;
                         Ok(info)
                     }
@@ -685,6 +794,7 @@ fn actor_loop(
                 let _ = reply.send(result);
             }
             Ok(Some(ActorRequest::Shutdown)) => break,
+            Ok(Some(ActorRequest::InventoryChanged)) => {},
             Ok(None) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -699,7 +809,9 @@ fn actor_loop(
             &mut next_reconnect,
             &mut previous_state,
             &mut diagnostics,
+            &topology_revision,
         );
+        *lock(&cached_state) = previous_state.clone();
     }
 }
 
@@ -729,7 +841,7 @@ fn reject_expired_request(request: ActorRequest) {
         ActorRequest::ReadTargetInfo { reply, .. } => {
             let _ = reply.send(Err(MESSAGE.to_owned()));
         }
-        ActorRequest::Shutdown => {}
+        ActorRequest::Shutdown | ActorRequest::InventoryChanged => {}
     }
 }
 
@@ -744,10 +856,37 @@ fn service_background(
     next_reconnect: &mut Instant,
     previous_state: &mut Option<DeviceMemoryState>,
     diagnostics: &mut DeviceDiagnostics,
+    topology_revision: &Arc<AtomicU64>,
 ) {
+    if Instant::now() >= *next_status_poll {
+        invalidate_inventory();
+        if let Ok(mut state) = build_state(saved, session.is_some(), last_error.clone(), diagnostics) {
+            let selected_key = state.selected.as_ref().map(|device| device.device_key.as_str());
+            if session.is_some() && session_key.as_deref() != selected_key {
+                *session = None;
+                *session_key = None;
+                *next_reconnect = Instant::now();
+            }
+            if previous_state.as_ref().and_then(|old| old.selected.as_ref())
+                .map(|device| device.device_key.as_str()) != selected_key {
+                diagnostics.reset_for_device_change();
+                *last_error = None;
+                state = state_from(saved, state.candidates, false, None, diagnostics);
+            }
+            if previous_state.as_ref() != Some(&state) {
+                // Publish the new routing target before connect/input events.
+                emit_state(app, &state);
+                emit_device_lifecycle_events(app, previous_state.as_ref(), &state);
+                *previous_state = Some(state);
+            }
+        }
+        *next_status_poll = Instant::now() + STATUS_POLL_INTERVAL;
+    }
     if let Some(active) = session.as_mut() {
         match active.read_report(IDLE_REPORT_POLL_INTERVAL) {
-            Ok(Some(wire_report)) => route_idle_report(app, &wire_report),
+            Ok(Some(wire_report)) => {
+                if let Some(key) = session_key.as_deref() { route_idle_report(app, key, &wire_report); }
+            },
             Ok(None) => {}
             Err(error) => {
                 let error = error.to_string();
@@ -762,7 +901,7 @@ fn service_background(
 
     let now = Instant::now();
     if reopen_requested && session.is_none() && now >= *next_reconnect {
-        match open_saved_session(saved, session, session_key, None) {
+        match open_saved_session(saved, session, session_key, None, topology_revision) {
             Ok(()) => *last_error = None,
             Err(error) => {
                 diagnostics.record_failure(session_key.as_deref(), &error);
@@ -772,15 +911,11 @@ fn service_background(
         *next_reconnect = Instant::now() + RECONNECT_INTERVAL;
     }
 
-    if now >= *next_status_poll {
-        if let Ok(state) = build_state(saved, session.is_some(), last_error.clone(), diagnostics) {
-            if previous_state.as_ref() != Some(&state) {
-                emit_device_lifecycle_events(app, previous_state.as_ref(), &state);
-                emit_state(app, &state);
-                *previous_state = Some(state);
-            }
+    if let Ok(state) = build_state(saved, session.is_some(), last_error.clone(), diagnostics) {
+        if previous_state.as_ref() != Some(&state) {
+            emit_state(app, &state);
+            *previous_state = Some(state);
         }
-        *next_status_poll = Instant::now() + STATUS_POLL_INTERVAL;
     }
 }
 
@@ -853,6 +988,14 @@ fn remember_selection(
         schema_version: 1,
         device_key: chosen.device_key.clone(),
         serial_number: chosen.serial_number.clone().filter(|value| !value.is_empty()),
+        receiver_key: {
+            let receivers: Vec<_> = candidates.iter().filter(|device| !is_wired(device)).collect();
+            (receivers.len() == 1).then(|| receivers[0].device_key.clone())
+        },
+        wired_key: {
+            let wired: Vec<_> = candidates.iter().filter(|device| is_wired(device)).collect();
+            (wired.len() == 1).then(|| wired[0].device_key.clone())
+        },
     };
     save_selection(selection_path, &selection)?;
     *saved = Some(selection);
@@ -864,6 +1007,7 @@ fn open_saved_session(
     session: &mut Option<atk_device::ReportSession>,
     session_key: &mut Option<String>,
     expected_device_key: Option<&str>,
+    topology_revision: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let candidates = enumerate_candidates()?;
     let selected = match resolve_selection(saved, &candidates) {
@@ -892,6 +1036,7 @@ fn open_saved_session(
         .map_err(|error| error.to_string())?,
     );
     *session_key = Some(selected.device_key.clone());
+    if let Some(active) = session.as_mut() { active.watch_topology_changes(Arc::clone(topology_revision)); }
     Ok(())
 }
 
@@ -918,6 +1063,13 @@ fn validate_expected_device_key(expected: Option<&str>, actual: &str) -> Result<
     Ok(())
 }
 
+fn report_error_invalidates_session(error: &atk_device::DeviceError) -> bool {
+    !matches!(error, atk_device::DeviceError::UnsupportedMouseCommand { .. }
+        | atk_device::DeviceError::InvalidRequestReportLength { .. }
+        | atk_device::DeviceError::InvalidRequestChecksum
+        | atk_device::DeviceError::Protocol(atk_protocol::ParseError::DataLengthTooLarge { .. }))
+}
+
 fn validate_close_target(
     saved: Option<&SavedSelection>,
     active_key: Option<&str>,
@@ -930,18 +1082,19 @@ fn validate_close_target(
     validate_expected_device_key(expected_key, &actual_key)
 }
 
-fn emit_wire_report(app: &AppHandle, wire_report: &[u8]) {
+fn emit_wire_report(app: &AppHandle, device_key: &str, wire_report: &[u8]) {
     if wire_report.len() != atk_device::WIRE_REPORT_LEN {
         return;
     }
     let payload = DeviceMemoryInputReport {
+        device_key: device_key.to_owned(),
         report_id: wire_report[0],
         data: wire_report[1..].to_vec(),
     };
     let _ = app.emit("device-memory-input-report", payload);
 }
 
-fn route_idle_report(app: &AppHandle, wire_report: &[u8]) {
+fn route_idle_report(app: &AppHandle, device_key: &str, wire_report: &[u8]) {
     if wire_report.len() != atk_device::WIRE_REPORT_LEN
         || wire_report[0] != atk_device::TRANSPORT_REPORT_ID
     {
@@ -951,10 +1104,13 @@ fn route_idle_report(app: &AppHandle, wire_report: &[u8]) {
     if packet.first() != Some(&0x0a) || packet[4] > 10 {
         return;
     }
-    emit_wire_report(app, wire_report);
+    emit_wire_report(app, device_key, wire_report);
 }
 
 fn emit_state(app: &AppHandle, state: &DeviceMemoryState) {
+    if let Some(bridge) = app.try_state::<DeviceMemoryBridge>() {
+        *lock(&bridge.cached_state) = Some(state.clone());
+    }
     let _ = app.emit("device-memory-state", state);
 }
 
@@ -1019,12 +1175,75 @@ mod tests {
         }
     }
 
+    fn wired(key: &str) -> atk_device::TargetDevice {
+        let mut device = target(key, Some("wired-serial"));
+        device.interface.vendor_id = atk_device::WIRED_VENDOR_ID;
+        device.interface.product_id = atk_device::WIRED_PRODUCT_ID;
+        device
+    }
+
+    #[test]
+    fn rejected_outbound_commands_do_not_invalidate_a_working_connection() {
+        assert!(!report_error_invalidates_session(&atk_device::DeviceError::UnsupportedMouseCommand { command_id: 0x09 }));
+        assert!(!report_error_invalidates_session(&atk_device::DeviceError::InvalidRequestChecksum));
+        assert!(report_error_invalidates_session(&atk_device::DeviceError::ReadFailed));
+        assert!(report_error_invalidates_session(&atk_device::DeviceError::TransportChanged));
+    }
+
+    #[test]
+    fn transport_handoff_prefers_cable_and_returns_to_saved_receiver() {
+        let saved = SavedSelection {
+            schema_version: 1,
+            device_key: "receiver".into(),
+            serial_number: Some("receiver-serial".into()),
+            ..Default::default()
+        };
+        let receiver = target("receiver", Some("receiver-serial"));
+        for candidates in [vec![receiver.clone()], vec![receiver.clone(), wired("usb")], vec![receiver]] {
+            let expected = if candidates.len() == 2 { "usb" } else { "receiver" };
+            assert!(matches!(resolve_selection(Some(&saved), &candidates),
+                SelectionResolution::Connected(device) | SelectionResolution::Reidentified(device)
+                if device.device_key == expected));
+        }
+        let originally_wired = SavedSelection {
+            device_key: "usb".into(),
+            serial_number: Some("wired-serial".into()),
+            receiver_key: Some("receiver".into()),
+            wired_key: Some("usb".into()),
+            ..saved
+        };
+        assert!(matches!(resolve_selection(Some(&originally_wired), &[target("receiver", Some("receiver-serial"))]),
+            SelectionResolution::Connected(device) if device.device_key == "receiver"));
+    }
+
+    #[test]
+    fn transport_handoff_rejects_ambiguous_inventory_and_stale_controls() {
+        let saved = SavedSelection { device_key: "receiver".into(), ..Default::default() };
+        assert!(matches!(resolve_selection(Some(&saved), &[target("receiver", None), wired("one"), wired("two")]),
+            SelectionResolution::Ambiguous));
+        assert!(matches!(resolve_selection(Some(&saved), &[target("receiver", None), target("other", None), wired("usb")]),
+            SelectionResolution::Ambiguous));
+        assert!(validate_expected_device_key(Some("receiver"), "usb").is_err());
+        assert!(validate_expected_device_key(Some("usb"), "receiver").is_err());
+    }
+
+    #[test]
+    fn cached_inventory_is_reused_without_enumeration_and_does_not_share_mutable_results() {
+        INVENTORY.with(|cache| *cache.borrow_mut() = Some(vec![wired("usb")]));
+        let mut first = enumerate_candidates().unwrap();
+        first.clear();
+        assert_eq!(enumerate_candidates().unwrap()[0].device_key, "usb");
+        invalidate_inventory();
+        INVENTORY.with(|cache| assert!(cache.borrow().is_none()));
+    }
+
     #[test]
     fn saved_path_wins_and_reidentifies_only_by_unique_serial_or_unique_target() {
         let saved = SavedSelection {
             schema_version: 1,
             device_key: "old-path".to_owned(),
             serial_number: Some("mouse-1".to_owned()),
+            ..Default::default()
         };
         let candidates = vec![target("new-path", Some("mouse-1")), target("other", Some("mouse-2"))];
         assert!(matches!(
@@ -1062,6 +1281,7 @@ mod tests {
             schema_version: 1,
             device_key: "saved".to_owned(),
             serial_number: Some("mouse-1".to_owned()),
+            ..Default::default()
         };
         let ambiguous = state_from(
             Some(&SavedSelection {
@@ -1135,6 +1355,7 @@ mod tests {
             schema_version: 1,
             device_key: "device-one".to_owned(),
             serial_number: None,
+            ..Default::default()
         };
         let selected = vec![target("device-one", None)];
         let mut diagnostics = DeviceDiagnostics::default();
@@ -1209,6 +1430,7 @@ mod tests {
             schema_version: 1,
             device_key: "remembered-key".to_owned(),
             serial_number: None,
+            ..Default::default()
         });
         let mut session_open = true;
         let mut clear_called = false;

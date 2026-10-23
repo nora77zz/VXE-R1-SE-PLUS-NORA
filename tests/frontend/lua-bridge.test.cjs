@@ -164,7 +164,10 @@ function makeHarness({
     return invoke(command, ...args);
   } } };
   const document = {
-    addEventListener() {},
+    hidden: false,
+    listeners: new Map(),
+    addEventListener(name, listener) { this.listeners.set(name, listener); },
+    removeEventListener(name, listener) { if (this.listeners.get(name) === listener) this.listeners.delete(name); },
     createElement(tagName) { return new FakeElement(tagName); }
   };
   const context = {
@@ -185,7 +188,7 @@ function makeHarness({
   if (useLibrary) vm.runInNewContext(librarySource, context, { filename: libraryPath });
   vm.runInNewContext(bridgeSource, context, { filename: bridgePath });
   const container = new FakeContainer();
-  return { window, localStorage, intervals, container, alerts, selection };
+  return { window, document, localStorage, intervals, container, alerts, selection };
 }
 
 function deferred() {
@@ -197,6 +200,31 @@ function deferred() {
 function waitForAsyncWork() {
   return new Promise(resolve => setImmediate(resolve));
 }
+
+test('hidden Lua UI pauses interval queries and refreshes once when visible again', async () => {
+  const calls = [];
+  const harness = makeHarness({ invoke: async (command) => {
+    calls.push(command);
+    if (command === 'lua_status') return { state: 'idle' };
+    if (command === 'lua_logs') return { entries: [], nextCursor: null };
+    return null;
+  } });
+  harness.window.__mountLuaUI(harness.container);
+  await waitForAsyncWork();
+  const interval = [...harness.intervals.values()].find((entry) => entry.delay === 800);
+  assert.ok(interval);
+  harness.document.hidden = true;
+  const before = calls.length;
+  interval.callback();
+  await waitForAsyncWork();
+  assert.equal(calls.length, before);
+  harness.document.hidden = false;
+  harness.document.listeners.get('visibilitychange')();
+  await waitForAsyncWork();
+  assert.equal(calls.filter((command) => command === 'lua_status').length, 2);
+  harness.window.__unmountLuaUI();
+  assert.equal(harness.document.listeners.has('visibilitychange'), false);
+});
 
 function plain(value) {
   if (Array.isArray(value)) return value.map(plain);

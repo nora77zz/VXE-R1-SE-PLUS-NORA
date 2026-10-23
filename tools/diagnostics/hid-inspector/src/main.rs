@@ -286,7 +286,7 @@ mod windows_diagnostics {
         result
     }
 
-    fn inspect_path(path: &[u16]) -> Result<Option<CollectionDiagnostic>, DiagnosticError> {
+    fn inspect_path(path: &[u16], vendor_id: u16, product_id: u16) -> Result<Option<CollectionDiagnostic>, DiagnosticError> {
         let handle = match unsafe {
             CreateFileW(
                 PCWSTR(path.as_ptr()),
@@ -310,7 +310,7 @@ mod windows_diagnostics {
         let has_attributes = unsafe { HidD_GetAttributes(handle, &mut attributes) };
         let result = if has_attributes.0 == 0 {
             Err(win32_last_error("HidD_GetAttributes"))
-        } else if attributes.VendorID != TARGET_VENDOR_ID || attributes.ProductID != TARGET_PRODUCT_ID {
+        } else if attributes.VendorID != vendor_id || attributes.ProductID != product_id {
             Ok(None)
         } else {
             inspect_open_collection(handle, attributes).map(Some)
@@ -342,9 +342,9 @@ mod windows_diagnostics {
         path
     }
 
-    fn path_mentions_target(path: &[u16]) -> bool {
+    fn path_mentions_target(path: &[u16], vendor_id: u16, product_id: u16) -> bool {
         let text = OsString::from_wide(path).to_string_lossy().to_ascii_lowercase();
-        text.contains("vid_373b") && text.contains("pid_1085")
+        text.contains(&format!("vid_{vendor_id:04x}")) && text.contains(&format!("pid_{product_id:04x}"))
     }
 
     fn get_interface_path(
@@ -402,13 +402,13 @@ mod windows_diagnostics {
         Ok(path_from_detail(detail, required_size))
     }
 
-    fn run_diagnostics() -> DiagnosticOutput {
+    fn run_diagnostics(vendor_id: u16, product_id: u16) -> DiagnosticOutput {
         let mut output = DiagnosticOutput {
             schema_version: 1,
             status: "ok",
             operation: "read-only HID descriptor and caps inspection; no reports sent or read",
-            target_vendor_id: TARGET_VENDOR_ID,
-            target_product_id: TARGET_PRODUCT_ID,
+            target_vendor_id: vendor_id,
+            target_product_id: product_id,
             interface_candidates_matching_path: 0,
             collections_reported: 0,
             writes_sent: 0,
@@ -463,11 +463,11 @@ mod windows_diagnostics {
                     continue;
                 }
             };
-            if !path_mentions_target(&path) {
+            if !path_mentions_target(&path, vendor_id, product_id) {
                 continue;
             }
             output.interface_candidates_matching_path += 1;
-            match inspect_path(&path) {
+            match inspect_path(&path, vendor_id, product_id) {
                 Ok(Some(collection)) => output.collections.push(collection),
                 Ok(None) => {}
                 Err(error) => output.errors.push(error),
@@ -491,7 +491,24 @@ mod windows_diagnostics {
     }
 
     pub fn main() {
-        let output = run_diagnostics();
+        let args: Vec<_> = std::env::args().skip(1).collect();
+        if matches!(args.as_slice(), [help] if help == "--help" || help == "-h") {
+            println!("hid-diagnostics [--vid HEX --pid HEX]\nReads descriptor metadata only; no HID reports are transferred.");
+            return;
+        }
+        let target = match args.as_slice() {
+            [] => Some((TARGET_VENDOR_ID, TARGET_PRODUCT_ID)),
+            [vid_flag, vid, pid_flag, pid] if vid_flag == "--vid" && pid_flag == "--pid" => {
+                let parse = |value: &str| u16::from_str_radix(value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value), 16).ok();
+                parse(vid).zip(parse(pid))
+            }
+            _ => None,
+        };
+        let Some((vendor_id, product_id)) = target else {
+            eprintln!("Usage: hid-diagnostics [--vid HEX --pid HEX]");
+            std::process::exit(2);
+        };
+        let output = run_diagnostics(vendor_id, product_id);
         match serde_json::to_string_pretty(&output) {
             Ok(json) => println!("{json}"),
             Err(error) => {

@@ -483,11 +483,11 @@ struct SettingsAvailability {
 }
 
 #[tauri::command]
-fn device_info(
+async fn device_info(
     device_key: Option<String>,
     bridge: State<'_, device_bridge::DeviceMemoryBridge>,
 ) -> Result<atk_device::DeviceInfo, String> {
-    bridge.read_target_info_for(device_key)
+    bridge.read_target_info_for(device_key).await
 }
 
 #[tauri::command]

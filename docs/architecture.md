@@ -23,6 +23,14 @@ O processo Lua é distribuído como recurso do aplicativo. O backend procura pri
 
 A biblioteca de scripts salva os textos e o histórico localmente. O diagnóstico diferencia a enumeração do receptor da resposta à consulta de identidade. Esses estados não são uma medição de latência ou uma validação completa do hardware.
 
+## Conexão do mouse
+
+O transporte aceita as coleções de configuração FF02/2 do receptor `373B:1085` e do mouse USB `3554:F58F`, correlacionadas com a coleção FF04/2 do mesmo dispositivo físico. Com um mouse e um receptor conectados, o cabo tem prioridade; removê-lo restaura o receptor salvo. Inventários com múltiplos cabos ou pares ambíguos exigem seleção explícita.
+
+As notificações HID do Windows apenas sinalizam o ator. A enumeração aguarda a estabilização das coleções e tem uma nova tentativa curta, além da verificação periódica de recuperação. Leituras em andamento observam uma revisão da conexão e são interrompidas quando ela muda. Os comandos assíncronos mantêm a espera fora da thread da janela.
+
+O ator conserva o inventário e publica um estado em cache, evitando uma nova enumeração para cada pacote ou consulta da interface. Cada resposta carrega a chave do transporte que a produziu. A restauração exige uma nova resposta CID/MID e inicialização do controlador em cada conexão; a prova anterior perde a validade. A indicação de carregamento vem do GET de bateria, não apenas da presença do cabo.
+
 ## Atualizações
 
 `app_updates.js` consulta os comandos `app_update_status` e `app_update_check`. Uma oferta abre o diálogo com as versões e as notas. O botão de instalação envia apenas a versão confirmada a `app_update_install`; a interface não fornece um caminho de executável ou uma URL de download.

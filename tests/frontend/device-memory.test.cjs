@@ -132,6 +132,21 @@ function makeHarness({ state, devices = [], chooser, invokeOverrides = {}, promp
   return { hid, listeners, calls, window, getState: () => currentState };
 }
 
+test('stale reports from the previous transport cannot reach the selected mouse', async () => {
+  const selected = candidate('wired');
+  selected.interface.vendorId = 0x3554;
+  selected.interface.productId = 0xf58f;
+  const harness = makeHarness({ state: { candidates: [selected], selected, remembered: true, connected: true, ambiguous: false } });
+  const [device] = await harness.hid.getDevices();
+  let received = 0;
+  device.addEventListener('inputreport', () => { received += 1; });
+  const report = { reportId: 8, data: Array(16).fill(0) };
+  harness.listeners.get('device-memory-input-report')({ payload: { ...report, deviceKey: 'receiver' } });
+  assert.equal(received, 0);
+  harness.listeners.get('device-memory-input-report')({ payload: { ...report, deviceKey: 'wired' } });
+  assert.equal(received, 1);
+});
+
 test('saved connected receiver is restored by getDevices without invoking the browser chooser', async () => {
   const selected = candidate();
   const harness = makeHarness({
@@ -210,7 +225,7 @@ test('native report event reaches the original HID inputreport listeners with th
   assert.equal(sendCall.payload.deviceKey, selected.deviceKey);
   assert.equal(sendCall.payload.data.length, 16);
 
-  harness.listeners.get('device-memory-input-report')({ payload: { reportId: 8, data: Array.from({ length: 16 }, (_, index) => index + 1) } });
+  harness.listeners.get('device-memory-input-report')({ payload: { deviceKey: selected.deviceKey, reportId: 8, data: Array.from({ length: 16 }, (_, index) => index + 1) } });
 
   assert.equal(device.opened, true);
   assert.equal(observed.reportId, 8);

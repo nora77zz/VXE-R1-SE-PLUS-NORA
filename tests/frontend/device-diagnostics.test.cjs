@@ -71,6 +71,16 @@ function makeHarness({ state, onInfo, beforeInfo } = {}) {
   };
 }
 
+test('diagnostics follow USB charging and receiver transport without keeping stale charging text', async () => {
+  const harness = makeHarness({ state: receiverState({ transport: 'usb', identityResponded: true, charging: true }) });
+  await harness.api.refreshState();
+  assert.match(harness.api.view().title, /USB conectado · carregando/);
+  assert.match(harness.api.view().message, /3554:F58F/);
+  harness.listeners.get('device-memory-state')({ payload: receiverState({ transport: 'receiver', identityResponded: true, charging: false }) });
+  assert.doesNotMatch(harness.api.view().title, /carregando/);
+  assert.match(harness.api.view().message, /373B:1085/);
+});
+
 test('explains when no target receiver is enumerated and does not start a probe', async () => {
   const harness = makeHarness();
 

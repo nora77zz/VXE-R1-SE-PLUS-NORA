@@ -1154,7 +1154,11 @@ Coordenadas absolutas usam pixels da área de trabalho virtual e podem ser negat
     });
 
     if (logPollInterval) clearInterval(logPollInterval);
-    logPollInterval = setInterval(() => syncUi(true), 800);
+    logPollInterval = setInterval(() => {
+      if (!document.hidden) syncUi(true);
+    }, 800);
+    ui.onVisibilityChange = () => { if (!document.hidden && ui.active) syncUi(); };
+    document.addEventListener('visibilitychange', ui.onVisibilityChange);
     syncUi();
     syncStopShortcut();
   };
@@ -1163,6 +1167,7 @@ Coordenadas absolutas usam pixels da área de trabalho virtual e podem ser negat
   window.__unmountLuaUI = function() {
     console.log('[ATK HUB] Unmounting Lua Script UI');
     if (activeLuaUi) {
+      document.removeEventListener('visibilitychange', activeLuaUi.onVisibilityChange);
       activeLuaUi.active = false;
       activeLuaUi = null;
     }

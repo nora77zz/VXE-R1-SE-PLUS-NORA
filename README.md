@@ -1,6 +1,6 @@
 # ATK HUB
 
-ATK HUB é um aplicativo Windows para o VXE R1 SE+ Nora. Ele reúne as funções do mouse, diagnóstico do receptor e execução de scripts Lua em um único aplicativo desktop.
+ATK HUB é um aplicativo Windows para o VXE R1 SE+ Nora. Ele reúne as funções do mouse, diagnóstico da conexão e execução de scripts Lua. Reconhece o cabo USB e o receptor de 2,4 GHz, alterna entre eles automaticamente e mostra o carregamento informado pelo mouse.
 
 ## Instalar
 

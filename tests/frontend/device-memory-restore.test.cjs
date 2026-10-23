@@ -147,7 +147,7 @@ function makeHarness({ state = connectedState(), readInfo = async () => deviceIn
     console,
   };
   vm.runInNewContext(bridgeSource, context, { filename: bridgePath });
-  return { window, hid, listeners, calls, getState: () => state };
+  return { window, hid, listeners, calls, getState: () => state, setState: (next) => { state = next; } };
 }
 
 function waitForIdentity(window) {
@@ -209,7 +209,7 @@ async function makeBundleIntegrationHarness() {
   harness.window.dispatchEvent(new FakeEvent('load'));
   const proof = await identityReady;
   const [nativeDevice] = await harness.hid.getDevices();
-  const entry = { device: nativeDevice, endpointPath: 'remembered-endpoint' };
+  let entry = { device: nativeDevice, endpointPath: 'remembered-endpoint' };
   let currentApi = null;
   let currentHidDevice = null;
   let resolveInitialization;
@@ -219,7 +219,7 @@ async function makeBundleIntegrationHarness() {
   const router = {
     currentRoute: { value: { name: 'Home', query: {} } },
     async replace(location) {
-      this.currentRoute.value = { name: 'Mouse', query: location.query || {} };
+      this.currentRoute.value = { name: location.name || 'Mouse', query: location.query || {} };
     },
   };
   const store = {
@@ -234,6 +234,8 @@ async function makeBundleIntegrationHarness() {
     getDeviceListAll: () => [entry],
     getCurrentApi: () => currentApi,
     getCurDeviceHid: () => currentHidDevice,
+    setCurrentApi: (value) => { currentApi = value; },
+    setDeviceHid: (value) => { currentHidDevice = value; },
     getDeviceStore: () => ({ setDeviceByDeviceHid: () => initialization }),
   };
   const runtime = {
@@ -274,8 +276,59 @@ async function makeBundleIntegrationHarness() {
     },
     getCurrentApi: () => currentApi,
     getCurrentHidDevice: () => currentHidDevice,
+    async switchTransport(selected) {
+      const next = connectedState({ candidates: [selected], selected });
+      harness.setState(next);
+      const [device] = await harness.hid.getDevices();
+      entry = { device, endpointPath: selected.deviceKey + '-endpoint', __atkControllerInitialization: Promise.resolve(true) };
+      // getDevices above refreshed state; include the previous selection in the
+      // event sequence so the bridge observes a real routing transition.
+      harness.listeners.get('device-memory-state')({ payload: connectedState({ selected: null, connected: false, candidates: [] }) });
+      harness.listeners.get('device-memory-state')({ payload: next });
+    },
   };
 }
+
+function wiredReceiver(key = 'wired-key') {
+  const device = receiver(key);
+  device.interface.vendorId = 0x3554;
+  device.interface.productId = 0xf58f;
+  return device;
+}
+
+test('live transport changes issue fresh identity proofs and invalidate old proofs in both directions', async () => {
+  const harness = makeHarness();
+  let ready = waitForIdentity(harness.window);
+  harness.window.dispatchEvent(new FakeEvent('load'));
+  let previous = await ready;
+  for (const selected of [wiredReceiver(), receiver()]) {
+    ready = waitForIdentity(harness.window);
+    const state = connectedState({ candidates: [selected], selected });
+    harness.setState(state);
+    harness.listeners.get('device-memory-state')({ payload: state });
+    const proof = await ready;
+    assert.equal(proof.deviceKey, selected.deviceKey);
+    assert.notEqual(proof.requestId, previous.requestId);
+    assert.equal(await harness.window.__atkDeviceMemory.validateAutoRestore(previous), false);
+    const [wrapper] = await harness.hid.getDevices();
+    assert.equal(harness.window.__atkDeviceMemory.claimAutoRestore(proof, wrapper, validContext(proof), () => {}), true);
+    previous = proof;
+  }
+  assert.deepEqual(harness.calls.filter((call) => call.command === 'device_info').map((call) => call.payload.deviceKey),
+    ['remembered-key', 'wired-key', 'remembered-key']);
+});
+
+test('the active bundle selects the new transport after cable insertion and removal', async () => {
+  const harness = await makeBundleIntegrationHarness();
+  harness.resolveInitialization(true);
+  assert.equal(await waitFor(() => harness.getSelectorCalls() === 1), true);
+  await harness.switchTransport(wiredReceiver());
+  assert.equal(await waitFor(() => harness.getSelectorCalls() === 2), true);
+  assert.equal(harness.router.currentRoute.value.query.endpointPath, 'wired-key-endpoint');
+  await harness.switchTransport(receiver());
+  assert.equal(await waitFor(() => harness.getSelectorCalls() === 3), true);
+  assert.equal(harness.router.currentRoute.value.query.endpointPath, 'remembered-key-endpoint');
+});
 
 test('one startup identity probe yields one proof and activates only once for the exact native receiver', async () => {
   const harness = makeHarness();

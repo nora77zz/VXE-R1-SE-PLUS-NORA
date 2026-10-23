@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use atk_protocol::{
     BatteryRaw, GetCommand, ParseError, RawResponse, Request, Response, PACKET_LEN, REPORT_ID,
@@ -13,8 +14,19 @@ use atk_protocol::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+pub mod device_changes;
+
 pub const TARGET_VENDOR_ID: u16 = 0x373b;
 pub const TARGET_PRODUCT_ID: u16 = 0x1085;
+// The active frontend lists VXE R1SE+ under this USB identity (bundle
+// index-DcEiQt_8.js, UTF-16 offset 11220359). Descriptor inspection on the
+// connected mouse confirms FF02/2 report 8 and its FF04/2 sibling.
+pub const WIRED_VENDOR_ID: u16 = 0x3554;
+pub const WIRED_PRODUCT_ID: u16 = 0xf58f;
+pub fn is_supported_transport(vendor_id: u16, product_id: u16) -> bool {
+    matches!((vendor_id, product_id),
+        (TARGET_VENDOR_ID, TARGET_PRODUCT_ID) | (WIRED_VENDOR_ID, WIRED_PRODUCT_ID))
+}
 pub const TARGET_USAGE_PAGE: u16 = 0xff02;
 pub const TARGET_USAGE: u16 = 0x0002;
 pub const TRANSPORT_REPORT_ID: u8 = REPORT_ID;
@@ -176,6 +188,7 @@ pub enum DeviceError {
     WriteFailed,
     ShortWrite { expected: usize, actual: usize },
     ReadFailed,
+    TransportChanged,
     DeadlineExpired { command_id: u8 },
     WrongReportLength { expected: usize, actual: usize },
     WrongReportId { expected: u8, actual: u8 },
@@ -212,6 +225,7 @@ impl fmt::Display for DeviceError {
                 write!(f, "HID report write returned {actual} bytes; expected {expected}")
             }
             Self::ReadFailed => f.write_str("HID report read failed"),
+            Self::TransportChanged => f.write_str("A conexão USB mudou; aguardando o transporte atual do mouse."),
             Self::DeadlineExpired { command_id } => {
                 write!(f, "deadline expired while awaiting GET command 0x{command_id:02x}")
             }
@@ -360,6 +374,7 @@ pub struct ReportSession {
     interface: InterfaceMetadata,
     device_key: String,
     timeout: Duration,
+    topology: Option<(Arc<AtomicU64>, u64)>,
 }
 
 impl ReportSession {
@@ -374,7 +389,17 @@ impl ReportSession {
             interface,
             device_key,
             timeout,
+            topology: None,
         }
+    }
+
+    pub fn watch_topology_changes(&mut self, revision: Arc<AtomicU64>) {
+        let baseline = revision.load(Ordering::Acquire);
+        self.topology = Some((revision, baseline));
+    }
+
+    fn topology_changed(&self) -> bool {
+        self.topology.as_ref().is_some_and(|(revision, baseline)| revision.load(Ordering::Acquire) != *baseline)
     }
 
     pub fn interface(&self) -> &InterfaceMetadata {
@@ -410,7 +435,13 @@ impl ReportSession {
         }
 
         let command_id = packet[0];
-        if !NATIVE_MOUSE_COMMAND_ALLOWLIST.contains(&command_id) {
+        // The active frontend's H0t.get()/y2t.getMouseInfo() sends command
+        // 0x01 as an eight-byte transport challenge: four random bytes followed
+        // by four zero bytes, at address zero (bundle offset 11138551).
+        // Permit that exact frame shape; other 0x01 payloads remain blocked.
+        let transport_challenge = command_id == 0x01 && packet[2..4] == [0, 0]
+            && packet[4] == 8 && packet[9..15].iter().all(|byte| *byte == 0);
+        if !NATIVE_MOUSE_COMMAND_ALLOWLIST.contains(&command_id) && !transport_challenge {
             return Err(DeviceError::UnsupportedMouseCommand { command_id });
         }
         let data_len = usize::from(packet[4]);
@@ -433,6 +464,7 @@ impl ReportSession {
         if request.packet_bytes().as_slice() != packet {
             return Err(DeviceError::InvalidRequestChecksum);
         }
+        if self.topology_changed() { return Err(DeviceError::TransportChanged); }
 
         let mut wire_request = Vec::with_capacity(WIRE_REPORT_LEN);
         wire_request.push(report_id);
@@ -452,15 +484,19 @@ impl ReportSession {
             .checked_add(self.timeout)
             .unwrap_or_else(Instant::now);
         loop {
+            if self.topology_changed() { return Err(DeviceError::TransportChanged); }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(DeviceError::DeadlineExpired { command_id });
             }
-            let Some(wire_report) = self
+            let read_timeout = if self.topology.is_some() { remaining.min(Duration::from_millis(25)) } else { remaining };
+            let report = self
                 .transport
-                .read_report(remaining)
-                .map_err(|_| DeviceError::ReadFailed)?
-            else {
+                .read_report(read_timeout)
+                .map_err(|_| DeviceError::ReadFailed)?;
+            if self.topology_changed() { return Err(DeviceError::TransportChanged); }
+            let Some(wire_report) = report else {
+                if self.topology.is_some() && Instant::now() < deadline { continue; }
                 return Err(DeviceError::DeadlineExpired { command_id });
             };
             if Instant::now() >= deadline {
@@ -815,7 +851,8 @@ mod native {
             let device_path = unsafe { PCWSTR((*detail).DevicePath.as_ptr()).to_string() }
                 .map_err(|_| DeviceError::DeviceContainerEnumeration)?;
             let lowered_path = interface_path_key(&device_path);
-            if !lowered_path.contains("vid_373b&pid_1085") {
+            if !lowered_path.contains("vid_373b&pid_1085")
+                && !lowered_path.contains("vid_3554&pid_f58f") {
                 continue;
             }
             let mut property_type = DEVPROPTYPE(0);
@@ -861,8 +898,7 @@ mod native {
     }
 
     fn matches_target(info: &hidapi::DeviceInfo) -> bool {
-        info.vendor_id() == TARGET_VENDOR_ID
-            && info.product_id() == TARGET_PRODUCT_ID
+        is_supported_transport(info.vendor_id(), info.product_id())
             && info.usage_page() == TARGET_USAGE_PAGE
             && info.usage() == TARGET_USAGE
     }
@@ -891,7 +927,7 @@ mod native {
         let infos: Vec<_> = api
             .device_list()
             .filter(|info| {
-                info.vendor_id() == TARGET_VENDOR_ID && info.product_id() == TARGET_PRODUCT_ID
+                is_supported_transport(info.vendor_id(), info.product_id())
             })
             .collect();
         Ok(infos
@@ -1349,6 +1385,50 @@ mod tests {
         let stats = stats.lock().unwrap();
         assert_eq!(stats.writes, 0);
         assert_eq!(stats.reads, 0);
+    }
+
+    #[test]
+    fn report_session_allows_only_the_source_confirmed_transport_challenge_shape() {
+        let (mut transport, stats) = MockTransport::tracked();
+        transport.reads.push_back(MockRead::Report(raw_wire_report(1, 0, 8, &[1, 2, 3, 4, 2, 32, 1, 0], 0)));
+        let mut session = ReportSession::new(transport, InterfaceMetadata::target(), "usb".into(), Duration::from_millis(50));
+        for request in [Request::from_fields(1, 0, 0, &[]).unwrap(),
+            Request::from_fields(1, 1, 8, &[1, 2, 3, 4, 0, 0, 0, 0]).unwrap(),
+            Request::from_fields(1, 0, 8, &[1, 2, 3, 4, 9, 0, 0, 0]).unwrap()] {
+            assert!(matches!(session.transact_hid_report(8, request.packet_bytes(), |_| {}), Err(DeviceError::UnsupportedMouseCommand { command_id: 1 })));
+        }
+        assert_eq!(stats.lock().unwrap().writes, 0);
+        let challenge = Request::from_fields(1, 0, 8, &[1, 2, 3, 4, 0, 0, 0, 0]).unwrap();
+        assert!(session.transact_hid_report(8, challenge.packet_bytes(), |_| {}).is_ok());
+        assert_eq!(stats.lock().unwrap().writes, 1);
+    }
+
+    #[test]
+    fn report_session_cancels_topology_change_before_write_and_during_wait() {
+        struct ChangingTransport { revision: Arc<AtomicU64>, writes: Arc<AtomicU64> }
+        impl ReportIo for ChangingTransport {
+            fn write_report(&mut self, report: &[u8]) -> Result<usize, TransportError> {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                Ok(report.len())
+            }
+            fn read_report(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+                assert!(timeout <= Duration::from_millis(25));
+                self.revision.fetch_add(1, Ordering::AcqRel);
+                Ok(None)
+            }
+        }
+        for before_write in [true, false] {
+            let revision = Arc::new(AtomicU64::new(0));
+            let writes = Arc::new(AtomicU64::new(0));
+            let mut session = ReportSession::new(
+                ChangingTransport { revision: Arc::clone(&revision), writes: Arc::clone(&writes) },
+                InterfaceMetadata::target(), "mouse".into(), Duration::from_secs(2));
+            session.watch_topology_changes(Arc::clone(&revision));
+            if before_write { revision.fetch_add(1, Ordering::AcqRel); }
+            let request = Request::get(GetCommand::GetBattery);
+            assert!(matches!(session.transact_hid_report(8, request.packet_bytes(), |_| {}), Err(DeviceError::TransportChanged)));
+            assert_eq!(writes.load(Ordering::Relaxed), if before_write { 0 } else { 1 });
+        }
     }
 
     #[test]

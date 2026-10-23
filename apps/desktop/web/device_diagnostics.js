@@ -63,15 +63,23 @@
     } else if (error && (status === 'failed' || requestError)) {
       title = status === 'failed' ? 'Falha de comunicação' : 'Não foi possível iniciar a verificação';
       message = error;
+    } else if (state && state.identityResponded === true && state.transport === 'usb') {
+      title = state.charging === true ? 'Mouse USB conectado · carregando' : 'Mouse USB conectado · mouse respondeu';
+      message = 'Transporte nativo: USB 3554:F58F.';
     } else if (state && state.identityResponded === true) {
       title = 'Receptor detectado · mouse respondeu';
-      message = 'A identidade do mouse foi confirmada nesta verificação.';
+      message = state.transport === 'receiver'
+        ? 'Transporte nativo: receptor 2,4 GHz 373B:1085.'
+        : 'A identidade do mouse foi confirmada nesta verificação.';
     } else if (!selectedKey) {
       title = 'Receptor detectado';
       message = 'Selecione um receptor no ATK HUB para verificar o mouse.';
     } else if (status === 'disconnected') {
       title = 'Receptor detectado · verificação anterior invalidada';
       message = 'O receptor desconectou depois da última verificação. Tente novamente após reconectar.';
+    } else if (state && state.transport === 'usb') {
+      title = 'Mouse conectado por USB';
+      message = 'Verificando a identidade e o carregamento do mouse.';
     } else {
       title = 'Receptor detectado · mouse ainda não verificado';
       message = 'A identidade do mouse ainda não foi confirmada.';

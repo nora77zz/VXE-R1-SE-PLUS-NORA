@@ -27,11 +27,15 @@
   const localListeners = new Map();
   let eventTarget = nativeHid;
   let lastState = null;
+  let stateRevision = 0;
   let autoRestoreStarted = false;
   let autoRestoreCancelled = false;
   let autoRestoreConsumed = false;
   let autoRestoreProof = null;
   let autoRestoreSequence = 0;
+  let restoreGeneration = 0;
+  let restoreEnabled = false;
+  let refreshPromise = null;
   const autoRestoreProofs = new WeakSet();
 
   function invokeNative(command, payload) {
@@ -41,7 +45,8 @@
   }
 
   function isTargetDevice(device) {
-    return !!device && device.vendorId === TARGET_VENDOR_ID && device.productId === TARGET_PRODUCT_ID;
+    return !!device && ((device.vendorId === TARGET_VENDOR_ID && device.productId === TARGET_PRODUCT_ID)
+      || (device.vendorId === 0x3554 && device.productId === 0xf58f));
   }
 
   function descriptorHasTargetCollection(device, collection) {
@@ -151,6 +156,7 @@
     const state = lastState;
     const selected = state && state.selected;
     if (!selected || !state.connected) return;
+    if (payload.deviceKey !== selected.deviceKey) return;
     const device = createNativeDevice(selected);
     const bytes = Uint8Array.from(payload.data);
     const data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -185,8 +191,19 @@
     await Promise.all([
       listen.call(tauri.event, 'device-memory-input-report', (event) => dispatchInputReport(event && event.payload)),
       listen.call(tauri.event, 'device-memory-state', (event) => {
+        stateRevision += 1;
+        const oldKey = lastState && lastState.selected && lastState.selected.deviceKey;
         lastState = event && event.payload ? event.payload : lastState;
+        const newKey = lastState && lastState.selected && lastState.selected.deviceKey;
         if (lastState && lastState.selected && lastState.connected) createNativeDevice(lastState.selected);
+        if (oldKey !== newKey) {
+          restoreGeneration += 1;
+          autoRestoreProof = null;
+          autoRestoreStarted = false;
+          autoRestoreConsumed = false;
+          autoRestoreCancelled = false;
+          if (restoreEnabled && newKey) Promise.resolve().then(beginAutoRestore);
+        }
       }),
       listen.call(tauri.event, 'device-memory-lifecycle', (event) => dispatchLifecycle(event && event.payload)),
     ]);
@@ -194,11 +211,16 @@
   eventsReady.catch(() => {});
 
   function refreshState() {
-    return eventsReady.then(() => invokeNative('device_memory_state')).then((state) => {
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = eventsReady.then(async () => {
+      const revision = stateRevision;
+      const state = await invokeNative('device_memory_state');
+      if (revision !== stateRevision) return lastState;
       lastState = state;
       if (state && state.selected && state.connected) createNativeDevice(state.selected);
       return state;
-    });
+    }).finally(() => { refreshPromise = null; });
+    return refreshPromise;
   }
 
   function isRememberedConnectedTarget(state) {
@@ -216,8 +238,7 @@
       && deviceKey.length > 0
       && matchingCandidates.length === 1
       && nativeInterface
-      && nativeInterface.vendorId === TARGET_VENDOR_ID
-      && nativeInterface.productId === TARGET_PRODUCT_ID
+      && isTargetDevice(nativeInterface)
       && nativeInterface.usagePage === TARGET_CONFIG_COLLECTION.usagePage
       && nativeInterface.usage === TARGET_CONFIG_COLLECTION.usage
       && isNativeTarget(selected);
@@ -238,8 +259,10 @@
   }
 
   async function beginAutoRestore() {
+    restoreEnabled = true;
     if (autoRestoreStarted || autoRestoreCancelled) return;
     autoRestoreStarted = true;
+    const generation = restoreGeneration;
     try {
       let state = await refreshState();
       if (!isRememberedConnectedTarget(state)) return;
@@ -247,15 +270,15 @@
 
       // This is one bounded read-only identity probe. The native command returns
       // the existing four-query snapshot; only its real 0x10 CID/MID are used.
-      const identity = readIdentity(await invokeNative('device_info'));
-      if (!identity || autoRestoreCancelled) return;
+      const identity = readIdentity(await invokeNative('device_info', { deviceKey }));
+      if (!identity || autoRestoreCancelled || generation !== restoreGeneration) return;
 
       state = await refreshState();
-      if (autoRestoreCancelled || !isRememberedConnectedTarget(state)
+      if (autoRestoreCancelled || generation !== restoreGeneration || !isRememberedConnectedTarget(state)
         || state.selected.deviceKey !== deviceKey) return;
 
       const proof = Object.freeze({
-        requestId: `startup-${Date.now()}-${++autoRestoreSequence}`,
+        requestId: `connection-${Date.now()}-${++autoRestoreSequence}`,
         deviceKey,
         cid: identity.cid,
         mid: identity.mid,
@@ -314,7 +337,7 @@
   }
 
   function isNativeTarget(candidate) {
-    return candidateHasExpectedCollections(candidate);
+    return candidate && isTargetDevice(candidate.interface) && candidateHasExpectedCollections(candidate);
   }
 
   function filterMatches(candidate, filter) {
@@ -340,6 +363,9 @@
     const matches = candidates.filter((candidate) => isNativeTarget(candidate) && candidateMatchesOptions(candidate, options));
     if (matches.length === 0) return [];
     if (matches.length === 1) return [matches[0]];
+    const wired = matches.filter((candidate) => candidate.interface.vendorId === 0x3554 && candidate.interface.productId === 0xf58f);
+    const receivers = matches.filter((candidate) => candidate.interface.vendorId === TARGET_VENDOR_ID && candidate.interface.productId === TARGET_PRODUCT_ID);
+    if (wired.length === 1 && receivers.length === 1 && matches.length === 2) return wired;
     if (typeof global.prompt !== 'function') {
       throw new DOMException('Mais de um receptor ATK foi encontrado; a seleção precisa ser explícita.', 'NotFoundError');
     }
@@ -421,10 +447,9 @@
   async function getDevices() {
     await eventsReady;
     const [state, browserDevices] = await Promise.all([
-      invokeNative('device_memory_state'),
+      refreshState(),
       nativeGetDevices(),
     ]);
-    lastState = state;
     const result = (browserDevices || []).filter((device) => !isTargetDevice(device));
     if (state && state.selected && state.connected && isNativeTarget(state.selected)) {
       result.push(createNativeDevice(state.selected));
