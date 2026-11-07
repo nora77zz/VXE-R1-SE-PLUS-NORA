@@ -1,5 +1,12 @@
 # Histórico de versões
 
+## [1.0.3] — 2026-11-07
+
+- O carregamento aparece logo ao conectar o cabo: a barra de diagnóstico mostra "carregando" em menos de 1 segundo e o ícone da bateria muda em seguida.
+- A porcentagem da bateria atualiza em tempo real enquanto a janela está aberta. As leituras pausam com a janela escondida ou depois de 1 minuto sem uso do computador, para o mouse continuar podendo dormir.
+- A barra de diagnóstico mostra a porcentagem da bateria e indica quando o mouse carrega por um carregador de tomada.
+- `atk.time.sleep` nos scripts Lua respeita o tempo pedido: `sleep(16)` passou de cerca de 30 ms para 16 ms, e `sleep(1)` de 15 ms para cerca de 1,6 ms.
+
 ## [1.0.2] — 2026-11-07
 
 - O aviso "New Version" do topo agora só aparece quando há uma versão nova do ATK HUB, e "Update now" instala essa versão. Antes ele mostrava a versão 3.2.32 do aplicativo oficial da ATK e não fazia nada ao clicar.
