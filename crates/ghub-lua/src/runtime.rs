@@ -16,6 +16,13 @@ const DEFAULT_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_INSTRUCTION_CHECK_INTERVAL: u32 = 1_000;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
 const MAX_LOG_BYTES: usize = 8_192;
+/// A condition-variable timeout follows the OS timer resolution (about 15.6 ms
+/// on Windows by default), which made `sleep(1)` last ~15 ms and `sleep(16)`
+/// ~30 ms. It is used only for the part of a sleep that ends before this tail;
+/// the tail uses `thread::sleep`, a high-resolution waitable timer on Windows.
+const SLEEP_PRECISE_TAIL: Duration = Duration::from_millis(20);
+/// Precise-phase slice, bounding how late a cancellation is observed.
+const SLEEP_PRECISE_SLICE: Duration = Duration::from_millis(1);
 
 /// A physical keyboard scan code. Numeric Lua key values use the same Set-1
 /// scan-code convention; they are not virtual-key codes.
@@ -550,9 +557,16 @@ impl WorkerControl {
                 }
                 return Ok(());
             }
-            let result = self.sleep_wake.wait_timeout(guard, remaining);
-            let (next_guard, _) = result.unwrap_or_else(|poison| poison.into_inner());
-            guard = next_guard;
+            if remaining > SLEEP_PRECISE_TAIL {
+                let result = self.sleep_wake.wait_timeout(guard, remaining - SLEEP_PRECISE_TAIL);
+                let (next_guard, _) = result.unwrap_or_else(|poison| poison.into_inner());
+                guard = next_guard;
+            } else {
+                // Flags are polled every slice here, so a wake-up cannot be lost.
+                drop(guard);
+                thread::sleep(remaining.min(SLEEP_PRECISE_SLICE));
+                guard = self.lock_sleep();
+            }
         }
     }
 
@@ -2214,6 +2228,33 @@ mod tests {
         handle
             .wait_until_ready(Duration::from_secs(2))
             .expect("script should complete its startup chunk");
+    }
+
+    #[test]
+    fn short_sleeps_follow_the_requested_duration_instead_of_the_os_timer_tick() {
+        let backend = Arc::new(MockBackend::default());
+        let runtime = runtime(&backend);
+        let mut handle = runtime
+            .start(
+                r#"
+local function average_ms(ms, n)
+    local started = atk.time.now_us()
+    for _ = 1, n do atk.time.sleep(ms) end
+    return (atk.time.now_us() - started) / n / 1000
+end
+atk.log.write("%.3f %.3f %.3f", average_ms(1, 40), average_ms(5, 20), average_ms(16, 20))
+"#,
+            )
+            .expect("worker starts");
+        wait_ready(&mut handle);
+        backend.wait_for_log_count(1);
+        let line = backend.log_snapshot().remove(0);
+        let averages: Vec<f64> = line.split(' ').map(|value| value.parse().expect("number")).collect();
+        // With the 15.6 ms default timer these were about 15, 15 and 30 ms.
+        assert!(averages[0] >= 1.0 && averages[0] < 4.0, "sleep(1) averaged {} ms", averages[0]);
+        assert!(averages[1] >= 5.0 && averages[1] < 8.0, "sleep(5) averaged {} ms", averages[1]);
+        assert!(averages[2] >= 16.0 && averages[2] < 20.0, "sleep(16) averaged {} ms", averages[2]);
+        let _ = handle.stop();
     }
 
     #[test]

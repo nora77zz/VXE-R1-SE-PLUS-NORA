@@ -1467,6 +1467,7 @@ fn main() {
             device_bridge::device_memory_open,
             device_bridge::device_memory_close,
             device_bridge::device_memory_send_report,
+            device_bridge::device_battery_watch,
             device_get_settings,
             device_update,
             lua_start,

@@ -48,6 +48,11 @@
     return fallback;
   }
 
+  function batterySuffix(state) {
+    const level = state && state.batteryLevel;
+    return Number.isInteger(level) && level >= 0 && level <= 100 ? ` · bateria ${level}%` : '';
+  }
+
   function viewModel() {
     const state = latestState;
     const enumerated = hasEnumeratedReceiver(state);
@@ -64,10 +69,13 @@
       title = status === 'failed' ? 'Falha de comunicação' : 'Não foi possível iniciar a verificação';
       message = error;
     } else if (state && state.identityResponded === true && state.transport === 'usb') {
-      title = state.charging === true ? 'Mouse USB conectado · carregando' : 'Mouse USB conectado · mouse respondeu';
+      title = (state.charging === true ? 'Mouse USB conectado · carregando' : 'Mouse USB conectado · mouse respondeu')
+        + batterySuffix(state);
       message = 'Transporte nativo: USB 3554:F58F.';
     } else if (state && state.identityResponded === true) {
-      title = 'Receptor detectado · mouse respondeu';
+      // A wall charger keeps the mouse on the receiver while it charges.
+      title = (state.charging === true ? 'Receptor detectado · mouse carregando' : 'Receptor detectado · mouse respondeu')
+        + batterySuffix(state);
       message = state.transport === 'receiver'
         ? 'Transporte nativo: receptor 2,4 GHz 373B:1085.'
         : 'A identidade do mouse foi confirmada nesta verificação.';

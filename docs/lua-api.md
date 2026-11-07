@@ -79,7 +79,7 @@ atk.keyboard.capture_events(true) -- only if atk.capabilities.keyboard_events is
 | `atk.log.write(message_or_format, ...args)` | With one argument, send that UTF-8 message unchanged. With additional arguments, format using Lua `string.format`. The final message is limited to 8,192 bytes. No newline is appended automatically. |
 | `atk.log.clear()` | Clear the host script log. |
 
-Logs and releases remain available to shutdown callbacks until the runtime's deadline. New input presses and movement are rejected after shutdown begins. Microsecond arguments and timestamps do not guarantee microsecond scheduling accuracy; Windows scheduling and the active backend determine the actual delay.
+Logs and releases remain available to shutdown callbacks until the runtime's deadline. New input presses and movement are rejected after shutdown begins. Microsecond arguments and timestamps do not guarantee microsecond scheduling accuracy; Windows scheduling and the active backend determine the actual delay. Sleeps end within about a millisecond of the requested time: the final 20 ms use a high-resolution timer instead of the 15.6 ms default system tick, and cancellation is still observed within about a millisecond. Measured in the Windows worker, `sleep(1)` averaged 1.6 ms and `sleep(16)` 16.4 ms.
 
 ## Finite sequences
 

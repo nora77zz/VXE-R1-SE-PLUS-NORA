@@ -81,6 +81,18 @@ test('diagnostics follow USB charging and receiver transport without keeping sta
   assert.match(harness.api.view().message, /373B:1085/);
 });
 
+test('the live battery level and wall-charger charging appear in the diagnostics title', async () => {
+  const harness = makeHarness({ state: receiverState({ transport: 'usb', identityResponded: true, charging: true, batteryLevel: 36 }) });
+  await harness.api.refreshState();
+  assert.equal(harness.api.view().title, 'Mouse USB conectado · carregando · bateria 36%');
+
+  harness.listeners.get('device-memory-state')({ payload: receiverState({ transport: 'receiver', identityResponded: true, charging: true, batteryLevel: 37 }) });
+  assert.equal(harness.api.view().title, 'Receptor detectado · mouse carregando · bateria 37%');
+
+  harness.listeners.get('device-memory-state')({ payload: receiverState({ transport: 'receiver', identityResponded: true, charging: false, batteryLevel: null }) });
+  assert.equal(harness.api.view().title, 'Receptor detectado · mouse respondeu');
+});
+
 test('a state event during page load waits for the docked panel instead of creating a floating one', async () => {
   const listeners = new Map();
   const created = [];

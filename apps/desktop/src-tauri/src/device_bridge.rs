@@ -29,6 +29,17 @@ const CLOSED_SESSION_REQUEST_WAIT: Duration = Duration::from_millis(30);
 /// so a short wait loses no report and a queued request waits at most ~1 ms.
 const IDLE_REPORT_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const IDLE_REPORT_DRAIN_LIMIT: usize = 8;
+/// Battery cadence while the window is visible and the user is active. The
+/// original UI reads the battery only when a device initializes.
+const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Background battery queries give up quickly, so a sleeping mouse never holds
+/// UI commands behind the 2 s query deadline.
+const BATTERY_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
+/// Retry delay after an unanswered battery query (mouse asleep or out of range).
+const BATTERY_UNANSWERED_RETRY: Duration = Duration::from_secs(5);
+/// Periodic queries pause after this much system-wide input inactivity, so they
+/// cannot keep an unattended mouse from sleeping.
+const BATTERY_USER_IDLE_LIMIT: Duration = Duration::from_secs(60);
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(750);
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -55,6 +66,8 @@ pub struct DeviceMemoryState {
     pub communication_error: Option<String>,
     pub transport: Option<&'static str>,
     pub charging: Option<bool>,
+    /// Raw battery percentage from GET 0x04 of the selected, identified mouse.
+    pub battery_level: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -76,9 +89,20 @@ struct DeviceDiagnostics {
     last_check_at_ms: Option<u64>,
     communication_error: Option<String>,
     charging: Option<bool>,
+    battery_level: Option<u8>,
 }
 
 impl DeviceDiagnostics {
+    /// Returns whether the reading differs from the last one.
+    fn record_battery(&mut self, battery: atk_protocol::BatteryRaw) -> bool {
+        let level = Some(battery.battery_level);
+        let charging = charging_from_raw(battery.charging);
+        let changed = self.battery_level != level || self.charging != charging;
+        self.battery_level = level;
+        self.charging = charging;
+        changed
+    }
+
     fn record_response(&mut self, device_key: &str, identity: Option<(u8, u8)>) {
         self.target_device_key = Some(device_key.to_owned());
         self.last_check_at_ms = Some(unix_time_ms());
@@ -104,6 +128,7 @@ impl DeviceDiagnostics {
         }
         self.identity_device_key = None;
         self.charging = None;
+        self.battery_level = None;
         self.status = DiagnosticStatus::Failed;
         self.last_check_at_ms = Some(unix_time_ms());
         self.communication_error = Some(error.to_owned());
@@ -112,6 +137,7 @@ impl DeviceDiagnostics {
     fn invalidate_for_disconnect(&mut self) {
         self.identity_device_key = None;
         self.charging = None;
+        self.battery_level = None;
         if self.target_device_key.is_some() {
             self.status = DiagnosticStatus::Disconnected;
         }
@@ -120,6 +146,46 @@ impl DeviceDiagnostics {
     fn reset_for_device_change(&mut self) {
         *self = Self::default();
     }
+}
+
+fn charging_from_raw(raw: u8) -> Option<bool> {
+    match raw {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// Live battery reading state kept by the actor.
+struct BatteryWatch {
+    /// Set by the UI: true while the window is visible.
+    visible: Arc<AtomicBool>,
+    /// Connection the last reading belongs to; a different key means a new
+    /// connection (for example, the charging cable was just plugged in).
+    device_key: Option<String>,
+    next_poll: Instant,
+}
+
+#[cfg(windows)]
+fn user_recently_active(limit: Duration) -> bool {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    // SAFETY: `info` is a valid, initialized LASTINPUTINFO with cbSize set.
+    if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        return true;
+    }
+    // SAFETY: GetTickCount has no preconditions; both values wrap together.
+    let idle_ms = unsafe { GetTickCount() }.wrapping_sub(info.dwTime);
+    u128::from(idle_ms) < limit.as_millis()
+}
+
+#[cfg(not(windows))]
+fn user_recently_active(_limit: Duration) -> bool {
+    true
 }
 
 fn unix_time_ms() -> u64 {
@@ -199,6 +265,7 @@ pub struct DeviceMemoryBridge {
     sender: SyncSender<ActorEnvelope>,
     actor_thread: Mutex<Option<JoinHandle<()>>>,
     cached_state: Arc<Mutex<Option<DeviceMemoryState>>>,
+    window_visible: Arc<AtomicBool>,
 }
 
 impl DeviceMemoryBridge {
@@ -220,14 +287,22 @@ impl DeviceMemoryBridge {
         let cached_state = Arc::new(Mutex::new(None));
         let actor_cache = Arc::clone(&cached_state);
         let actor_sender = sender.clone();
+        // Visible until the UI reports otherwise, so readings start at launch.
+        let window_visible = Arc::new(AtomicBool::new(true));
+        let battery = BatteryWatch {
+            visible: Arc::clone(&window_visible),
+            device_key: None,
+            next_poll: Instant::now(),
+        };
         let actor_thread = thread::Builder::new()
             .name("atk-device-memory".to_owned())
-            .spawn(move || actor_loop(app, selection_path, selection, startup_error, receiver, actor_sender, actor_cache))
+            .spawn(move || actor_loop(app, selection_path, selection, startup_error, receiver, actor_sender, actor_cache, battery))
             .map_err(|error| format!("Não foi possível iniciar o actor HID do mouse: {error}"))?;
         Ok(Self {
             sender,
             actor_thread: Mutex::new(Some(actor_thread)),
             cached_state,
+            window_visible,
         })
     }
 
@@ -287,6 +362,13 @@ pub async fn device_memory_state(
         return Ok(state);
     }
     bridge.request(ActorRequest::State).await
+}
+
+/// The UI reports window visibility; periodic battery reads run only while the
+/// window is visible. A new connection is always read once.
+#[tauri::command]
+pub fn device_battery_watch(visible: bool, bridge: State<'_, DeviceMemoryBridge>) {
+    bridge.window_visible.store(visible, Ordering::Release);
 }
 
 #[tauri::command]
@@ -504,6 +586,7 @@ fn state_from(
         communication_error: diagnostics.communication_error.clone(),
         transport,
         charging: identity_responded.then_some(diagnostics.charging).flatten(),
+        battery_level: identity_responded.then_some(diagnostics.battery_level).flatten(),
     }
 }
 
@@ -534,6 +617,7 @@ fn actor_loop(
     receiver: Receiver<ActorEnvelope>,
     sender: SyncSender<ActorEnvelope>,
     cached_state: Arc<Mutex<Option<DeviceMemoryState>>>,
+    mut battery: BatteryWatch,
 ) {
     let inventory_dirty = Arc::new(AtomicBool::new(false));
     let topology_revision = Arc::new(AtomicU64::new(0));
@@ -782,9 +866,10 @@ fn actor_loop(
                 let result = match result {
                     Ok((target_key, info)) => {
                         diagnostics.record_response(&target_key, identity_from_device_info(&info));
-                        diagnostics.charging = info.queries.iter().find(|query| query.command_id == 0x04)
-                            .and_then(|query| query.known_values.battery_raw.as_ref())
-                            .and_then(|battery| match battery.charging { 0 => Some(false), 1 => Some(true), _ => None });
+                        let battery = info.queries.iter().find(|query| query.command_id == 0x04)
+                            .and_then(|query| query.known_values.battery_raw.as_ref());
+                        diagnostics.charging = battery.and_then(|battery| charging_from_raw(battery.charging));
+                        diagnostics.battery_level = battery.map(|battery| battery.battery_level);
                         last_error = None;
                         Ok(info)
                     }
@@ -832,6 +917,7 @@ fn actor_loop(
             &mut previous_state,
             &mut diagnostics,
             &topology_revision,
+            &mut battery,
         );
         if request_handled || background_changed {
             *lock(&cached_state) = previous_state.clone();
@@ -883,6 +969,7 @@ fn service_background(
     previous_state: &mut Option<DeviceMemoryState>,
     diagnostics: &mut DeviceDiagnostics,
     topology_revision: &Arc<AtomicU64>,
+    battery: &mut BatteryWatch,
 ) -> bool {
     // A request handler may have changed the session, error, or diagnostics.
     let mut inputs_changed = request_handled;
@@ -950,6 +1037,12 @@ fn service_background(
         *next_reconnect = Instant::now() + RECONNECT_INTERVAL;
     }
 
+    if !request_handled
+        && service_battery(app, session, session_key, last_error, next_reconnect, diagnostics, battery)
+    {
+        inputs_changed = true;
+    }
+
     // build_state is a pure function of these inputs and the cached inventory,
     // so an unchanged iteration cannot produce a different state.
     if !inputs_changed {
@@ -962,6 +1055,86 @@ fn service_background(
         }
     }
     true
+}
+
+/// Reads GET 0x04 at once on a new connection, then every
+/// BATTERY_POLL_INTERVAL while the window is visible and the user is active.
+/// Returns whether diagnostics or the session changed.
+fn service_battery(
+    app: &AppHandle,
+    session: &mut Option<atk_device::ReportSession>,
+    session_key: &mut Option<String>,
+    last_error: &mut Option<String>,
+    next_reconnect: &mut Instant,
+    diagnostics: &mut DeviceDiagnostics,
+    battery: &mut BatteryWatch,
+) -> bool {
+    let (Some(active), Some(key)) = (session.as_mut(), session_key.clone()) else {
+        battery.device_key = None;
+        return false;
+    };
+    let now = Instant::now();
+    let new_connection = battery.device_key.as_deref() != Some(key.as_str());
+    if new_connection {
+        battery.device_key = Some(key.clone());
+        battery.next_poll = now;
+    }
+    if now < battery.next_poll {
+        return false;
+    }
+    if !new_connection
+        && (!battery.visible.load(Ordering::Acquire) || !user_recently_active(BATTERY_USER_IDLE_LIMIT))
+    {
+        battery.next_poll = now + BATTERY_POLL_INTERVAL;
+        return false;
+    }
+
+    let request = atk_protocol::Request::get(atk_protocol::GetCommand::GetBattery);
+    let app_for_event = app.clone();
+    let event_key = key.clone();
+    let result = active.transact_hid_report_within(
+        atk_protocol::REPORT_ID,
+        request.packet_bytes(),
+        BATTERY_QUERY_TIMEOUT,
+        move |report| emit_wire_report(&app_for_event, &event_key, &report),
+    );
+    match result {
+        Ok(wire_report) => {
+            battery.next_poll = Instant::now() + BATTERY_POLL_INTERVAL;
+            atk_protocol::Response::parse(atk_protocol::GetCommand::GetBattery, &wire_report[1..])
+                .ok()
+                .and_then(|response| response.battery_raw())
+                .is_some_and(|reading| diagnostics.record_battery(reading))
+        }
+        // No answer: the mouse is asleep or out of range. Keep the session.
+        Err(atk_device::DeviceError::DeadlineExpired { .. }) => {
+            battery.next_poll = now + BATTERY_UNANSWERED_RETRY;
+            false
+        }
+        // A cable was plugged in or removed: reopen on the new transport, which
+        // then gets an immediate reading. This is a handoff, not a failure.
+        Err(atk_device::DeviceError::TransportChanged) => {
+            *session = None;
+            *session_key = None;
+            *next_reconnect = Instant::now();
+            battery.device_key = None;
+            true
+        }
+        Err(error) if report_error_invalidates_session(&error) => {
+            let error = error.to_string();
+            diagnostics.record_failure(Some(key.as_str()), &error);
+            *session = None;
+            *session_key = None;
+            *last_error = Some(error);
+            *next_reconnect = Instant::now();
+            battery.device_key = None;
+            true
+        }
+        Err(_) => {
+            battery.next_poll = now + BATTERY_UNANSWERED_RETRY;
+            false
+        }
+    }
 }
 
 fn build_state(
@@ -1392,6 +1565,48 @@ mod tests {
             identity_from_device_info(&identity_info(2, Some(2), None)),
             None
         );
+    }
+
+    #[test]
+    fn live_battery_readings_are_published_only_for_an_identified_mouse_and_cleared_on_loss() {
+        let saved = SavedSelection {
+            schema_version: 1,
+            device_key: "device-one".to_owned(),
+            serial_number: None,
+            ..Default::default()
+        };
+        let selected = vec![target("device-one", None)];
+        let mut diagnostics = DeviceDiagnostics::default();
+        let reading = |level, charging| atk_protocol::BatteryRaw { battery_level: level, charging, voltage_be: 3743 };
+
+        assert!(diagnostics.record_battery(reading(35, 0)));
+        let unproven = state_from(Some(&saved), selected.clone(), true, None, &diagnostics);
+        assert_eq!(unproven.battery_level, None, "no reading before the identity proof");
+        assert_eq!(unproven.charging, None);
+
+        diagnostics.record_response("device-one", Some((2, 32)));
+        let proven = state_from(Some(&saved), selected.clone(), true, None, &diagnostics);
+        assert_eq!(proven.battery_level, Some(35));
+        assert_eq!(proven.charging, Some(false));
+
+        assert!(!diagnostics.record_battery(reading(35, 0)), "an identical reading is not a change");
+        assert!(diagnostics.record_battery(reading(35, 1)), "plugging the cable is a change");
+        let charging = state_from(Some(&saved), selected.clone(), true, None, &diagnostics);
+        assert_eq!(charging.charging, Some(true));
+        assert!(diagnostics.record_battery(reading(36, 1)));
+        assert_eq!(state_from(Some(&saved), selected.clone(), true, None, &diagnostics).battery_level, Some(36));
+
+        assert!(diagnostics.record_battery(reading(36, 2)));
+        assert_eq!(state_from(Some(&saved), selected.clone(), true, None, &diagnostics).charging, None,
+            "an unknown charging code is not reported as charging or discharging");
+
+        diagnostics.invalidate_for_disconnect();
+        let lost = state_from(Some(&saved), selected.clone(), true, None, &diagnostics);
+        assert_eq!(lost.battery_level, None);
+        diagnostics.record_response("device-one", Some((2, 32)));
+        diagnostics.record_battery(reading(40, 0));
+        diagnostics.record_failure(Some("device-one"), "falha");
+        assert_eq!(state_from(Some(&saved), selected, true, None, &diagnostics).battery_level, None);
     }
 
     #[test]

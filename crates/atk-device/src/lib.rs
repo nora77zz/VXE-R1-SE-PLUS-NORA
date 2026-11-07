@@ -417,6 +417,23 @@ impl ReportSession {
         &mut self,
         report_id: u8,
         packet: &[u8],
+        on_unsolicited: F,
+    ) -> Result<Vec<u8>, DeviceError>
+    where
+        F: FnMut(Vec<u8>),
+    {
+        let timeout = self.timeout;
+        self.transact_hid_report_within(report_id, packet, timeout, on_unsolicited)
+    }
+
+    /// Same as [`transact_hid_report`](Self::transact_hid_report) with a
+    /// caller-chosen response deadline, for background queries that should
+    /// give up quickly when the mouse is asleep.
+    pub fn transact_hid_report_within<F>(
+        &mut self,
+        report_id: u8,
+        packet: &[u8],
+        timeout: Duration,
         mut on_unsolicited: F,
     ) -> Result<Vec<u8>, DeviceError>
     where
@@ -481,7 +498,7 @@ impl ReportSession {
         }
 
         let deadline = Instant::now()
-            .checked_add(self.timeout)
+            .checked_add(timeout)
             .unwrap_or_else(Instant::now);
         loop {
             if self.topology_changed() { return Err(DeviceError::TransportChanged); }
@@ -1401,6 +1418,25 @@ mod tests {
         let challenge = Request::from_fields(1, 0, 8, &[1, 2, 3, 4, 0, 0, 0, 0]).unwrap();
         assert!(session.transact_hid_report(8, challenge.packet_bytes(), |_| {}).is_ok());
         assert_eq!(stats.lock().unwrap().writes, 1);
+    }
+
+    #[test]
+    fn report_session_honours_a_shorter_per_call_deadline() {
+        struct SilentTransport;
+        impl ReportIo for SilentTransport {
+            fn write_report(&mut self, report: &[u8]) -> Result<usize, TransportError> { Ok(report.len()) }
+            fn read_report(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, TransportError> {
+                std::thread::sleep(timeout.min(Duration::from_millis(5)));
+                Ok(None)
+            }
+        }
+        let mut session = ReportSession::new(SilentTransport, InterfaceMetadata::target(), "mouse".into(), Duration::from_secs(2));
+        session.watch_topology_changes(Arc::new(AtomicU64::new(0)));
+        let request = Request::get(GetCommand::GetBattery);
+        let started = Instant::now();
+        let result = session.transact_hid_report_within(8, request.packet_bytes(), Duration::from_millis(40), |_| {});
+        assert!(matches!(result, Err(DeviceError::DeadlineExpired { command_id: 0x04 })));
+        assert!(started.elapsed() < Duration::from_millis(500), "the 2 s session deadline was not used");
     }
 
     #[test]
