@@ -1,5 +1,13 @@
 # Histórico de versões
 
+## [1.0.2] — 2026-11-07
+
+- O aviso "New Version" do topo agora só aparece quando há uma versão nova do ATK HUB, e "Update now" instala essa versão. Antes ele mostrava a versão 3.2.32 do aplicativo oficial da ATK e não fazia nada ao clicar.
+- A página Sobre mostra a versão real do aplicativo.
+- Comandos enviados ao mouse respondem bem mais rápido: em sequência, caíram de cerca de 47 ms para 7 ms cada no receptor 2,4 GHz.
+- Eventos dos botões do mouse chegam aos scripts Lua sem espera, e o console Lua atualiza a cada 250 ms.
+- A barra de diagnóstico fica fixa embaixo também na primeira abertura do aplicativo.
+
 ## [1.0.1] — 2026-10-23
 
 - Suporte ao mouse no cabo USB 3554:F58F e alternância automática com o receptor 373B:1085.
