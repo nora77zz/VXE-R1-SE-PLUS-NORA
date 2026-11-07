@@ -477,13 +477,60 @@
     return installPromise;
   }
 
+  function cancelInitialCheck() {
+    if (initialTimer === null) return;
+    global.clearTimeout(initialTimer);
+    initialTimer = null;
+  }
+
+  // The embedded vendor header asks once, on mount, whether a new app version
+  // exists. It shows its "New Version" badge when parseInt(appVersion) > 20, so
+  // only a real offer from this app's own updater maps to a value above it.
+  function headerVersion() {
+    cancelInitialCheck();
+    const pending = checkPromise || (status.state === 'idle' ? requestCheck(false) : Promise.resolve(status));
+    return pending.then(() => {
+      const version = offerVersion || (status.state === 'available' ? status.availableVersion : '');
+      if (!isNonEmptyVersion(version)) return undefined;
+      return {
+        version,
+        appVersion: '21',
+        description: status.notes || `ATK HUB ${version}`,
+        downloadPath: '',
+      };
+    }, () => undefined);
+  }
+
+  // The header popover button is itself the user's confirmation to install.
+  // The modal shows progress and any error with a retry option.
+  function installFromHeader() {
+    openModal('manual');
+    if (isNonEmptyVersion(offerVersion) && (status.state === 'available' || status.state === 'error')) {
+      return installUpdate();
+    }
+    return requestCheck(true).then(() => false);
+  }
+
+  global.__atkAppUpdates = Object.freeze({ headerVersion, installFromHeader });
+
   function start() {
     if (queuedTrayOpen) {
       queuedTrayOpen = false;
       onTrayOpen();
     }
-    initialTimer = global.setTimeout(() => { void requestCheck(false); }, INITIAL_CHECK_DELAY_MS);
+    if (status.state === 'idle' && !checkPromise) {
+      initialTimer = global.setTimeout(() => {
+        initialTimer = null;
+        void requestCheck(false);
+      }, INITIAL_CHECK_DELAY_MS);
+    }
     periodicTimer = global.setInterval(() => { void requestCheck(false); }, CHECK_INTERVAL_MS);
+  }
+
+  if (tauri.app && typeof tauri.app.getVersion === 'function') {
+    Promise.resolve(tauri.app.getVersion()).then((version) => {
+      if (isNonEmptyVersion(version)) global.__atkAppVersion = version;
+    }).catch(() => {});
   }
 
   if (tauri.event && typeof tauri.event.listen === 'function') {

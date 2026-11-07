@@ -12,9 +12,23 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const SELECTION_FILE: &str = "device_selection.json";
+/// Inventory refresh when Windows device notifications are unavailable.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Recovery refresh while device notifications already schedule hotplug
+/// refreshes. Each refresh enumerates HID devices on the actor thread, so it is
+/// kept infrequent to avoid stalling UI requests.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WATCHED_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const HOTPLUG_SETTLE_INTERVAL: Duration = Duration::from_millis(60);
-const IDLE_REPORT_POLL_INTERVAL: Duration = Duration::from_millis(30);
+/// Longest wait for a UI request while a session is open. A request wakes the
+/// actor immediately; this only bounds how late unsolicited reports are routed.
+const OPEN_SESSION_REQUEST_WAIT: Duration = Duration::from_millis(8);
+/// Wait without an open session, where only timers need servicing.
+const CLOSED_SESSION_REQUEST_WAIT: Duration = Duration::from_millis(30);
+/// Idle drain read. Windows keeps the overlapped read pending after a timeout,
+/// so a short wait loses no report and a queued request waits at most ~1 ms.
+const IDLE_REPORT_READ_TIMEOUT: Duration = Duration::from_millis(1);
+const IDLE_REPORT_DRAIN_LIMIT: usize = 8;
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(750);
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -524,7 +538,7 @@ fn actor_loop(
     let inventory_dirty = Arc::new(AtomicBool::new(false));
     let topology_revision = Arc::new(AtomicU64::new(0));
     #[cfg(windows)]
-    let _watcher = {
+    let watcher = {
         let dirty = Arc::clone(&inventory_dirty);
         let revision = Arc::clone(&topology_revision);
         atk_device::device_changes::DeviceChangeWatcher::new(move || {
@@ -537,6 +551,10 @@ fn actor_loop(
             }
         }).ok()
     };
+    #[cfg(windows)]
+    let status_poll_interval = if watcher.is_some() { WATCHED_STATUS_POLL_INTERVAL } else { STATUS_POLL_INTERVAL };
+    #[cfg(not(windows))]
+    let status_poll_interval = STATUS_POLL_INTERVAL;
     let mut session: Option<atk_device::ReportSession> = None;
     let mut session_key: Option<String> = None;
     let mut reopen_requested = false;
@@ -560,9 +578,11 @@ fn actor_loop(
             if hotplug_retry.is_some_and(|deadline| Instant::now() >= deadline) { hotplug_retry = None; }
             next_status_poll = Instant::now();
         }
-        let received = receiver.recv_timeout(IDLE_REPORT_POLL_INTERVAL).map(|envelope| {
+        let request_wait = if session.is_some() { OPEN_SESSION_REQUEST_WAIT } else { CLOSED_SESSION_REQUEST_WAIT };
+        let received = receiver.recv_timeout(request_wait).map(|envelope| {
             request_before_deadline(envelope, Instant::now())
         });
+        let request_handled = matches!(received, Ok(Some(_)));
         match received {
             Ok(Some(ActorRequest::State(reply))) => {
                 let _ = reply.send(build_state(
@@ -798,20 +818,24 @@ fn actor_loop(
             Ok(None) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        service_background(
+        let background_changed = service_background(
             &app,
             saved.as_ref(),
             &mut session,
             &mut session_key,
             reopen_requested,
+            request_handled,
             &mut last_error,
             &mut next_status_poll,
+            status_poll_interval,
             &mut next_reconnect,
             &mut previous_state,
             &mut diagnostics,
             &topology_revision,
         );
-        *lock(&cached_state) = previous_state.clone();
+        if request_handled || background_changed {
+            *lock(&cached_state) = previous_state.clone();
+        }
     }
 }
 
@@ -851,14 +875,19 @@ fn service_background(
     session: &mut Option<atk_device::ReportSession>,
     session_key: &mut Option<String>,
     reopen_requested: bool,
+    request_handled: bool,
     last_error: &mut Option<String>,
     next_status_poll: &mut Instant,
+    status_poll_interval: Duration,
     next_reconnect: &mut Instant,
     previous_state: &mut Option<DeviceMemoryState>,
     diagnostics: &mut DeviceDiagnostics,
     topology_revision: &Arc<AtomicU64>,
-) {
+) -> bool {
+    // A request handler may have changed the session, error, or diagnostics.
+    let mut inputs_changed = request_handled;
     if Instant::now() >= *next_status_poll {
+        inputs_changed = true;
         invalidate_inventory();
         if let Ok(mut state) = build_state(saved, session.is_some(), last_error.clone(), diagnostics) {
             let selected_key = state.selected.as_ref().map(|device| device.device_key.as_str());
@@ -880,27 +909,37 @@ fn service_background(
                 *previous_state = Some(state);
             }
         }
-        *next_status_poll = Instant::now() + STATUS_POLL_INTERVAL;
+        *next_status_poll = Instant::now() + status_poll_interval;
     }
-    if let Some(active) = session.as_mut() {
-        match active.read_report(IDLE_REPORT_POLL_INTERVAL) {
-            Ok(Some(wire_report)) => {
-                if let Some(key) = session_key.as_deref() { route_idle_report(app, key, &wire_report); }
-            },
-            Ok(None) => {}
-            Err(error) => {
-                let error = error.to_string();
-                diagnostics.record_failure(session_key.as_deref(), &error);
-                *session = None;
-                *session_key = None;
-                *last_error = Some(error);
-                *next_reconnect = Instant::now();
+    // A transaction already drains interleaved reports. Skipping the idle read
+    // after a request lets back-to-back UI packets run without any wait.
+    // Queued reports are drained together, bounded so a report burst cannot
+    // delay the next UI request.
+    if !request_handled {
+        for _ in 0..IDLE_REPORT_DRAIN_LIMIT {
+            let Some(active) = session.as_mut() else { break };
+            match active.read_report(IDLE_REPORT_READ_TIMEOUT) {
+                Ok(Some(wire_report)) => {
+                    if let Some(key) = session_key.as_deref() { route_idle_report(app, key, &wire_report); }
+                },
+                Ok(None) => break,
+                Err(error) => {
+                    inputs_changed = true;
+                    let error = error.to_string();
+                    diagnostics.record_failure(session_key.as_deref(), &error);
+                    *session = None;
+                    *session_key = None;
+                    *last_error = Some(error);
+                    *next_reconnect = Instant::now();
+                    break;
+                }
             }
         }
     }
 
     let now = Instant::now();
     if reopen_requested && session.is_none() && now >= *next_reconnect {
+        inputs_changed = true;
         match open_saved_session(saved, session, session_key, None, topology_revision) {
             Ok(()) => *last_error = None,
             Err(error) => {
@@ -911,12 +950,18 @@ fn service_background(
         *next_reconnect = Instant::now() + RECONNECT_INTERVAL;
     }
 
+    // build_state is a pure function of these inputs and the cached inventory,
+    // so an unchanged iteration cannot produce a different state.
+    if !inputs_changed {
+        return false;
+    }
     if let Ok(state) = build_state(saved, session.is_some(), last_error.clone(), diagnostics) {
         if previous_state.as_ref() != Some(&state) {
             emit_state(app, &state);
             *previous_state = Some(state);
         }
     }
+    true
 }
 
 fn build_state(

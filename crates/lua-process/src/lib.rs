@@ -153,6 +153,10 @@ impl LuaProcessRuntime {
 
         let executable = canonical_worker_path(worker_executable.as_ref())?;
         let (command_tx, command_rx) = mpsc::sync_channel(self.config.event_queue_capacity);
+        // The broker blocks on worker output. Dispatch also posts a wake frame
+        // there so a queued host event is written to the worker immediately.
+        let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
+        let wake_tx = output_tx.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (report_tx, report_rx) = mpsc::sync_channel(1);
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -170,6 +174,8 @@ impl LuaProcessRuntime {
                     backend,
                     config,
                     command_rx,
+                    output_tx,
+                    output_rx,
                     broker_stop_requested,
                     ready_tx,
                     report_tx,
@@ -180,6 +186,7 @@ impl LuaProcessRuntime {
         match ready_rx.recv_timeout(self.config.startup_timeout + Duration::from_millis(1000)) {
             Ok(Ok(())) => Ok(LuaProcessHandle {
                 commands: command_tx,
+                wake: wake_tx,
                 report: Some(report_rx),
                 pending_report: None,
                 join: Some(join),
@@ -205,6 +212,7 @@ impl LuaProcessRuntime {
 
 pub struct LuaProcessHandle {
     commands: SyncSender<HostCommand>,
+    wake: SyncSender<OutputFrame>,
     report: Option<Receiver<ProcessReport>>,
     pending_report: Option<ProcessReport>,
     join: Option<JoinHandle<()>>,
@@ -219,7 +227,11 @@ impl LuaProcessHandle {
         validate_event(&wire)
             .map_err(|message| ProcessError::InvalidConfiguration(message.to_owned()))?;
         match self.commands.try_send(HostCommand::Event(wire)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // A full output queue means the broker is already awake.
+                let _ = self.wake.try_send(OutputFrame::Wake);
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => Err(ProcessError::EventQueueFull),
             Err(TrySendError::Disconnected(_)) => Err(ProcessError::WorkerStopped),
         }
@@ -318,6 +330,8 @@ enum OutputFrame {
     Message(WorkerMessage),
     Eof,
     Invalid(String),
+    /// Posted by `LuaProcessHandle::dispatch`; carries no worker data.
+    Wake,
 }
 
 fn broker_main(
@@ -326,6 +340,8 @@ fn broker_main(
     backend: Arc<dyn InputBackend>,
     config: ProcessConfig,
     commands: Receiver<HostCommand>,
+    output_tx: SyncSender<OutputFrame>,
+    output_rx: Receiver<OutputFrame>,
     stop_requested: Arc<AtomicBool>,
     ready: SyncSender<Result<(), String>>,
     report: SyncSender<ProcessReport>,
@@ -348,7 +364,6 @@ fn broker_main(
             .spawn(move || drain_stderr(stderr, tail));
     }
 
-    let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -595,7 +610,7 @@ fn broker_main(
                 }
                 break;
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(OutputFrame::Wake) | Err(RecvTimeoutError::Timeout) => {}
         }
 
         if stopping && stop_deadline.is_some_and(|deadline| Instant::now() >= deadline) {

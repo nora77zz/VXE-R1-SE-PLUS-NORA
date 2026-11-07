@@ -62,7 +62,6 @@
 
   const ipcShim = {
     invoke: async function(cmd, ...args) {
-      console.log('[IPC Invoke]', cmd, args);
       if (cmd === 'close-win') {
         return invokeNative('window_close');
       }
@@ -185,6 +184,9 @@
   let legacySettingsMigrationPromise = null;
   const STORAGE_KEY = 'atk_vxe_lua_script';
   const MAX_CONSOLE_ENTRIES = 1000;
+  // Status and incremental logs are cheap in-memory reads on the backend; a
+  // short interval keeps the console and Run/Stop state close to real time.
+  const LUA_POLL_INTERVAL_MS = 250;
 
   const DEFAULT_SCRIPT = `-- Exemplo seguro: somente registra eventos e o encerramento.
 -- Para ações de mouse/teclado, selecione um preset ou adicione chamadas da API ATK.
@@ -1156,7 +1158,7 @@ Coordenadas absolutas usam pixels da área de trabalho virtual e podem ser negat
     if (logPollInterval) clearInterval(logPollInterval);
     logPollInterval = setInterval(() => {
       if (!document.hidden) syncUi(true);
-    }, 800);
+    }, LUA_POLL_INTERVAL_MS);
     ui.onVisibilityChange = () => { if (!document.hidden && ui.active) syncUi(); };
     document.addEventListener('visibilitychange', ui.onVisibilityChange);
     syncUi();

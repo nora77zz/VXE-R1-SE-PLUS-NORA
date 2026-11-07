@@ -31,6 +31,8 @@ const PROFILE_STORE_FILE: &str = "profiles.json";
 const MAX_ARCHIVED_LOGS: usize = 1_000;
 const STOP_SHORTCUT_DEFAULT: &str = "Ctrl+Alt+F11";
 const STOP_SHORTCUT_FILE: &str = "lua-stop-shortcut.json";
+#[cfg(windows)]
+const EVENT_PUMP_IDLE_WAIT: Duration = Duration::from_millis(5);
 
 pub(crate) struct AppState {
     lua_status: Arc<Mutex<LuaStatus>>,
@@ -835,7 +837,9 @@ fn event_pump_main(
             break;
         }
 
-        match listener.try_recv_raw() {
+        // Wake on the event itself instead of sleeping between polls; the
+        // timeout only bounds how often stop and worker exit are checked.
+        match listener.recv_raw_timeout(EVENT_PUMP_IDLE_WAIT) {
             Ok(raw_event) => {
                 let events = raw_input_to_script_events(raw_event);
                 let dispatch = {
@@ -857,10 +861,8 @@ fn event_pump_main(
                     break;
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                thread::sleep(Duration::from_millis(2));
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if !stop.load(Ordering::Acquire) {
                     pump_error = Some(fail_event_pump(
                         &process,

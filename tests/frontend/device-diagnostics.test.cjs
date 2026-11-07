@@ -81,6 +81,53 @@ test('diagnostics follow USB charging and receiver transport without keeping sta
   assert.match(harness.api.view().message, /373B:1085/);
 });
 
+test('a state event during page load waits for the docked panel instead of creating a floating one', async () => {
+  const listeners = new Map();
+  const created = [];
+  const docked = {
+    id: 'atk-device-diagnostics',
+    className: '',
+    style: {},
+    children: [],
+    setAttribute() {},
+    appendChild(child) { this.children.push(child); return child; },
+    replaceChildren(...children) { this.children = children; },
+    querySelector() { return null; },
+  };
+  let parsed = false;
+  const document = {
+    readyState: 'loading',
+    body: { appendChild(node) { created.push(node); } },
+    getElementById(id) { return parsed && id === 'atk-device-diagnostics' ? docked : null; },
+    createElement(tag) {
+      const node = { tag, style: {}, children: [], setAttribute() {}, appendChild(child) { this.children.push(child); return child; },
+        replaceChildren(...children) { this.children = children; }, addEventListener() {}, querySelector() { return null; } };
+      if (tag === 'aside') created.push(node);
+      return node;
+    },
+    addEventListener(name, callback) { listeners.set(`document:${name}`, callback); },
+  };
+  const window = {
+    document,
+    __TAURI__: {
+      core: { async invoke(command) { if (command === 'device_memory_state') return receiverState(); throw new Error(command); } },
+      event: { async listen(name, callback) { listeners.set(name, callback); return () => {}; } },
+    },
+  };
+  vm.runInNewContext(moduleSource, { window, Promise, Date, Number, Object }, { filename: modulePath });
+  await Promise.resolve();
+
+  listeners.get('device-memory-state')({ payload: receiverState() });
+  assert.equal(created.length, 0, 'no floating fallback is created while the document is loading');
+
+  parsed = true;
+  document.readyState = 'interactive';
+  listeners.get('document:DOMContentLoaded')();
+  assert.equal(created.length, 0);
+  assert.ok(docked.children.length > 0, 'the docked panel from index.html is used');
+  assert.equal(docked.style.cssText, undefined, 'the docked panel keeps the responsive stylesheet layout');
+});
+
 test('explains when no target receiver is enumerated and does not start a probe', async () => {
   const harness = makeHarness();
 

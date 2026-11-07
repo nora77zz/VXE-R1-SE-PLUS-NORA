@@ -12,7 +12,7 @@ use ghub_lua::{
 use std::fmt;
 use std::mem::{size_of, MaybeUninit};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -872,6 +872,12 @@ impl RawInputListener {
     /// Receives a typed physical input event without blocking.
     pub fn try_recv_raw(&self) -> Result<RawInputEvent, TryRecvError> {
         self.events.try_recv()
+    }
+
+    /// Waits up to `timeout` for a typed physical input event, returning as
+    /// soon as one arrives.
+    pub fn recv_raw_timeout(&self, timeout: Duration) -> Result<RawInputEvent, RecvTimeoutError> {
+        self.events.recv_timeout(timeout)
     }
 
     /// Reports physical transitions rejected because the bounded queue was full.

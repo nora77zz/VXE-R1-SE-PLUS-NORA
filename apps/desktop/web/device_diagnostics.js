@@ -102,6 +102,10 @@
   function ensureHost() {
     if (host || !global.document || !global.document.body) return host;
     host = global.document.getElementById('atk-device-diagnostics');
+    // A state event can arrive at cold start before the parser reaches the
+    // <aside> in index.html. Creating the floating fallback then would replace
+    // the docked bar; start() renders again after DOMContentLoaded.
+    if (!host && global.document.readyState === 'loading') return null;
     const hostWasProvided = !!host;
     if (!host) {
       host = global.document.createElement('aside');

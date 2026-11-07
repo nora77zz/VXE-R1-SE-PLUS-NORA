@@ -183,6 +183,7 @@ function makeHarness({ tauri = true, invokeHandlers = {}, readyState = 'complete
 
   vm.runInNewContext(moduleSource, { window, Promise, Number, Set, Object, String, Math }, { filename: modulePath });
   return {
+    window,
     calls,
     document,
     events,
@@ -261,6 +262,60 @@ test('automatic check waits for the user and installs only the exact offered ver
   await harness.flush();
   assert.equal(harness.element('later').disabled, true);
   assert.equal(harness.element('close').disabled, true);
+});
+
+test('header badge reflects only this app updater offer and checks once without the startup delay', async () => {
+  const harness = makeHarness({ invokeHandlers: { app_update_check: async () => available('1.0.2') } });
+  const offer = await harness.window.__atkAppUpdates.headerVersion();
+  await harness.flush();
+  assert.equal(offer.version, '1.0.2');
+  assert.ok(parseInt(offer.appVersion, 10) > 20, 'the vendor header shows its badge above 20');
+  assert.equal(offer.description, 'Melhorias e correções.');
+  assert.equal(offer.downloadPath, '');
+  assert.equal(harness.calls.filter((call) => call.command === 'app_update_check').length, 1);
+  assert.equal([...harness.timers.values()].some((timer) => !timer.interval), false,
+    'the delayed initial check is not scheduled again');
+
+  const upToDate = makeHarness({
+    invokeHandlers: { app_update_check: async () => ({ currentVersion: '1.0.1', state: 'upToDate' }) },
+  });
+  assert.equal(await upToDate.window.__atkAppUpdates.headerVersion(), undefined);
+});
+
+test('header Update now installs the offered version in one click and shows progress in the dialog', async () => {
+  let finishInstall;
+  const harness = makeHarness({
+    invokeHandlers: {
+      app_update_check: async () => available('1.0.2'),
+      app_update_install: () => new Promise((resolve) => { finishInstall = resolve; }),
+    },
+  });
+  await harness.window.__atkAppUpdates.headerVersion();
+  await harness.flush();
+  harness.element('later').click();
+
+  const installing = harness.window.__atkAppUpdates.installFromHeader();
+  await harness.flush();
+  const installs = harness.calls.filter((call) => call.command === 'app_update_install');
+  assert.equal(installs.length, 1);
+  assert.equal(installs[0].payload.expectedVersion, '1.0.2');
+  assert.equal(harness.element('root').hidden, false);
+  assert.equal(harness.element('later').disabled, true);
+  finishInstall({ ...available('1.0.2'), state: 'installing' });
+  assert.equal(await installing, true);
+});
+
+test('header Update now without a current offer opens the dialog and checks again', async () => {
+  const harness = makeHarness({
+    invokeHandlers: {
+      app_update_status: { currentVersion: '1.0.1', state: 'upToDate' },
+      app_update_check: { currentVersion: '1.0.1', state: 'upToDate' },
+    },
+  });
+  assert.equal(await harness.window.__atkAppUpdates.installFromHeader(), false);
+  assert.equal(harness.element('root').hidden, false);
+  assert.equal(harness.calls.some((call) => call.command === 'app_update_install'), false);
+  assert.equal(harness.calls.filter((call) => call.command === 'app_update_check').length, 1);
 });
 
 test('release notes remain literal text and cannot create markup', async () => {

@@ -211,7 +211,7 @@ test('hidden Lua UI pauses interval queries and refreshes once when visible agai
   } });
   harness.window.__mountLuaUI(harness.container);
   await waitForAsyncWork();
-  const interval = [...harness.intervals.values()].find((entry) => entry.delay === 800);
+  const interval = [...harness.intervals.values()].find((entry) => entry.delay === 250);
   assert.ok(interval);
   harness.document.hidden = true;
   const before = calls.length;
